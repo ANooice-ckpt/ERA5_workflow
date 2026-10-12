@@ -1,0 +1,106 @@
+# This workspace contains large local datasets. Only reviewed source paths below
+# are offered to Git. Add an explicit exception when introducing a new file area.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/00_README.txt
+!/RUN_LOCAL.ps1
+
+# Local preprocessing code is reproducible source; its products stay local.
+!/02_local/
+/02_local/*
+!/02_local/mask/
+/02_local/mask/*
+!/02_local/mask/README.txt
+!/02_local/mask/run_mask.ps1
+!/02_local/mask/test_population_mask.R
+!/02_local/mask/validate_mask.R
+!/02_local/audit/
+/02_local/audit/*
+!/02_local/audit/check_month_reader.R
+!/02_local/audit/path_migration.csv
+
+# Version the server software and input checksums, not the assembled data bundle.
+!/03_server_bundle/
+/03_server_bundle/*
+!/03_server_bundle/code/
+/03_server_bundle/code/*
+!/03_server_bundle/code/*.R
+!/03_server_bundle/code/model_environment_versions.csv
+!/03_server_bundle/config.R
+!/03_server_bundle/config_pilot.R
+!/03_server_bundle/README_SERVER.txt
+!/03_server_bundle/run_server.sh
+!/03_server_bundle/SHA256SUMS.txt
+!/03_server_bundle/WEATHER_MD5SUMS.txt
+
+# Keep the result-retrieval instructions, not scientific output/checkpoints.
+!/04_results/
+/04_results/*
+!/04_results/README.txt
+
+# Required by test_population_mask.R: retain this exact historical source.
+# Other archived versions, fitted models and old reports remain local.
+!/90_archive/
+/90_archive/*
+!/90_archive/scripts/
+/90_archive/scripts/*
+!/90_archive/scripts/0.5°_ERA5-Figure1-population.R
+
+# Credentials and per-machine settings, including inside allowed directories.
+.env
+.env.*
+.Renviron
+.Renviron.*
+.cdsapirc
+.netrc
+.git-credentials
+.aws/
+.ssh/
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
+# R sessions, installed libraries, editor state and temporary output.
+.Rhistory
+.RData
+.Rdata
+.Ruserdata
+.Rproj.user/
+renv/library/
+renv/staging/
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Extra protection if a data/cache file is dropped into a source directory.
+*.[Rr][Dd][Ss]
+*.[Rr][Dd][Aa]
+*.nc
+*.nc4
+*.tif
+*.tiff
+*.grib
+*.grb
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.zip
+*.7z
+*.tar
+*.gz

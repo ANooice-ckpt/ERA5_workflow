@@ -1,0 +1,27 @@
+#!/usr/bin/env Rscript
+# Read-only readiness report. Does not load fitted models or start predictions.
+args <- commandArgs(trailingOnly=TRUE)
+if (length(args)!=1L) stop("Usage: Rscript --vanilla code/07_check_server.R config.R")
+cmd <- commandArgs(FALSE)
+script <- sub("^--file=","",grep("^--file=",cmd,value=TRUE)[1L])
+base <- dirname(normalizePath(script,mustWork=TRUE))
+source(file.path(base,"00_core_loader.R"))
+cfg <- stream_read_config(args[1L])
+needed <- c("ncdf4","digest","Rcpp","brms","posterior","rstan","dlnm","FNN","splines")
+present <- vapply(needed,requireNamespace,logical(1),quietly=TRUE)
+print(data.frame(package=needed,installed=present,
+  version=vapply(needed,function(p) if(requireNamespace(p,quietly=TRUE))
+    as.character(utils::packageVersion(p)) else NA_character_,character(1))),row.names=FALSE)
+inputs <- unlist(cfg$remote[c("m0_file","m1_file","data_file","pred_file")],use.names=FALSE)
+stopifnot(all(file.exists(inputs)),file.exists(file.path(cfg$remote$pack_dir,"pack_index.rds")))
+stream_load_warm02(file.path(base,"warm02_reference.R"))
+source(file.path(base,"02_stream_overrides.R"))
+source(file.path(base,"09_parallel_runtime.R"))
+fast_stream_scheduling(cfg$run)
+problems <- character()
+if (any(!present)) problems <- c(problems,paste("Install missing R packages:",paste(needed[!present],collapse=", ")))
+scenario_error <- tryCatch({fast_stream_validate_scenarios(cfg$cdd$scenarios,2000L); NULL},
+  error=function(e) conditionMessage(e))
+if (!is.null(scenario_error)) problems <- c(problems,paste("CDD scenario configuration:",scenario_error))
+if (length(problems)) stop(paste(problems,collapse="\n"),call.=FALSE)
+message("SERVER PREFLIGHT PASS: packages and declared input/scenario configuration. Model prediction QC runs in 03_run_ecs.R.")

@@ -1,2 +1,30 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Keep source checkouts usable on Linux even when Windows core.autocrlf=true.
+* text=auto eol=lf
+*.R text eol=lf
+*.ps1 text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.json text eol=lf
+
+# Scientific provenance and the existing SHA256 manifest use exact bytes.
+# -text disables newline conversion while retaining ordinary text diffs.
+# The environment CSV currently contains CRLF; preserve its existing checksum.
+03_server_bundle/code/warm02_reference.R -text !eol
+03_server_bundle/code/model_environment_versions.csv -text !eol
+90_archive/scripts/0.5°_ERA5-Figure1-population.R -text !eol
+
+# These normally remain ignored; do not apply text conversion if added later.
+*.rds binary
+*.RDS binary
+*.rda binary
+*.RData binary
+*.nc binary
+*.nc4 binary
+*.tif binary
+*.tiff binary
+*.png binary
+*.pdf binary
+*.zip binary
+*.gz binary

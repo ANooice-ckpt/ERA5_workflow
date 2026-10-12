@@ -1,0 +1,10 @@
+087437efb43d4f37330af7b5e75e0fd6  weather/packed_2010.nc
+60258a695a45fc2424ae974ccf1cefa9  weather/packed_2011.nc
+b5f5b25b11277499fd4a45f1da2e1514  weather/packed_2012.nc
+abda3b77675abc9905eca996bf85d61f  weather/packed_2013.nc
+8eb36cb431e1c2394fba8575fb1a00eb  weather/packed_2014.nc
+9a4549bfab8d3e934a4a32ad37184078  weather/packed_2015.nc
+007ec9dba866a49211f0efdb38bf8b46  weather/packed_2016.nc
+f2f7a3558272ddd4bff434eaa4d59fb9  weather/packed_2017.nc
+8497a084dfa05198ba20359dfd5026f2  weather/packed_2018.nc
+f8fe15c5a3fd2d76a962c91912a04c52  weather/packed_2019.nc
