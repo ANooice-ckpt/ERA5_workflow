@@ -10,7 +10,13 @@ ncdf4, digest, Rcpp, brms, posterior, rstan, dlnm, FNN, splines。
 模型来源的包版本记录在 code/model_environment_versions.csv；它是历史环境记录，
 不是自动安装锁文件。原始拟合和服务器预测的数值 QC 仍由 03_run_ecs.R 执行。
 
-在 config.R 中预先填入 CDD 情景的 name/theta0/slope/kappa。
+config.R 已按 2026-10-12 的确认声明 CDD18_lambda0.9683_kappa1 情景：
+theta0=18°C，slope=1/0.9683，kappa=1。图片给出 ΔTa≈0.9683×ΔU，
+引擎使用 kappa/slope，故 slope 应填倒数；截距 0.583 在差值中抵消。
+kappa=1 是室内温度变化等量转移到室外 CDD 门槛的情景假设。
+逐日计算 CDD_M0=max(Ta_outdoor-18,0)、CDD_M1=max(Ta_outdoor-18-0.9683×ΔU,0) 后累加。
+固定换算系数沿用全部 2000 个配对抽样，不额外抽样；未包含系数自身的不确定性。
+预测前仍需核验预处理元数据并设置 preprocessing_acknowledged，以及通过真实模型数值 QC。
 当前 workers=32；根据实际内存、单 worker 峰值和试跑速度调整。
 默认 scheduling="lpt"：按 tile 中选中格点数降序派发，耗时相同时按 tile ID 排序。
 全部待算 tile 共用连续动态队列，空闲 worker 立即领取下一块，没有 2×workers 的批次屏障。

@@ -47,7 +47,11 @@
 
 当前 `config.R` 中的本地根路径及 PowerShell 入口中的 R 安装路径是这台 Windows 机器的设置。换机器后按实际位置调整；不要把凭据写入这些已跟踪的文件。历史参考脚本中的旧路径作为溯源信息保留。
 
-运行前必须明确填写 `cdd$scenarios` 的 `name/theta0/slope/kappa`，并完成气象预处理元数据核验及 `preprocessing_acknowledged` 设置。当前不预设 CDD 情景；默认 32 workers 也不代表已完成云端调优。
+`cdd$scenarios` 已按 2026-10-12 的确认设置为 `theta0=18`、`slope=1/0.9683`、`kappa=1`。用户提供的图片给出 `ΔTa≈0.9683×ΔU`，而引擎使用 `κ/slope`，因此 `slope` 填倒数。`κ=1` 表示本情景将室温变化等量用于室外 CDD 门槛；截距 0.583 在差值中抵消，不加入 18°C 基准。
+
+对同一支持日期和配对抽样，逐日计算 `CDD_M0=max(Ta_outdoor−18,0)`、`CDD_M1=max(Ta_outdoor−18−0.9683×ΔU,0)` 后累加。三个参数均为固定标量，对 2,000 个抽样位置保持相同；当前不包含换算系数自身的不确定性。
+
+运行前仍需完成气象预处理元数据核验及 `preprocessing_acknowledged` 设置，以及真实模型数值 QC；默认 32 workers 也不代表已完成云端调优。
 
 合成测试入口为 `RUN_LOCAL.ps1 -Mode test`，需要相应的本地 R 环境；通过合成测试不等于真实模型或 ECS 已验证。服务器使用 `bash run_server.sh check` 核验完整输入后，再进行试跑。
 

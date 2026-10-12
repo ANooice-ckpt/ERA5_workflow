@@ -62,15 +62,18 @@ pack 会核对原始输入与已完成年度文件；通过校验的年份可以
 保留 run_*/global/checkpoints 的逐格年度后验、pack_index 和运行元数据，
 以后才能按区域重新聚合，不能只保存 PNG 或分位数表。
 
-尚待确定
+CDD 情景与运行前事项
 --------
-config.R 的 cdd$scenarios 仍为空；需要运行前确定 theta0、slope、kappa。
-这不影响本地气象打包；服务器正式预测前必须填写。
+config.R 已按 2026-10-12 的确认设置 theta0=18°C、slope=1/0.9683、kappa=1。
+图片给出 ΔTa≈0.9683×ΔU；现有公式使用 kappa/slope，因此 slope 填倒数。
+kappa=1 是将室内温度变化等量转移到室外 CDD 门槛的情景假设；截距 0.583 在差值中抵消。
+每日 CDD_M1=max(Ta_outdoor-18-0.9683×ΔU,0)，逐日截断后再累加。
+仍需完成预处理元数据核验并设置 preprocessing_acknowledged，以及真实模型数值 QC。
 workers 目前为 32，未依据真实 ECS 性能调优；本地输出不代表云端已跑通。
 调度现为连续动态队列＋LPT；默认按 tile 选中格点数从多到少派发。
 服务器运行后，global/tile_timings_<session>.csv 可查看各阶段耗时，
 global/dispatch_<session>.csv 记录待派发顺序，progress.csv 记录完成进度。
-本地 test 入口包含原有 48 项数值回归和 24 项实际 PSOCK 合成并行测试。
+本地 test 入口包含 50 项数值回归（含 SET→Ta 换算）和 24 项实际 PSOCK 合成并行测试。
 
 迁移与溯源
 ----------

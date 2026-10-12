@@ -1,5 +1,5 @@
 # Shared local/server configuration. Launchers set ERA5_BUNDLE_ROOT automatically.
-# Scientific settings must be explicit; no default cooling scenario is assumed.
+# Scientific settings are explicit; the CDD scenario below was declared on 2026-10-12.
 bundle_root <- Sys.getenv("ERA5_BUNDLE_ROOT",unset="/data/era5")
 local_project <- "E:/ERA5/ERA5_workflow"
 ERA5_CONFIG <- list(
@@ -42,11 +42,17 @@ ERA5_CONFIG <- list(
     preprocessing_acknowledged = FALSE
   ),
   cdd = list(
-    # Required before ECS production. Example FIELD NAMES only (not recommended values):
-    # scenarios = list(list(name = "declared_scenario", theta0 = ..., slope = ..., kappa = ...))
-    # theta0: degree C Ta balance point; slope: positive SET-on-Ta slope;
-    # kappa: >=0 degree SET shift transfer multiplier.
+    # Declared 2026-10-12: baseline 18 C; supplied image gives delta_Ta = 0.9683 * delta_U.
+    # The engine uses delta_theta = (kappa / slope) * delta_U, so slope is 1/lambda.
+    # kappa=1 explicitly assumes equal indoor-shift to outdoor-CDD-threshold transfer.
+    # The supplied intercept 0.583 cancels in differences; it is not added to theta0.
+    # theta0: outdoor CDD balance point (C); slope: positive SET-on-indoor-Ta slope.
     # Each can be a scalar or a 2000-value posterior vector; do not resample per grid.
-    scenarios = list()
+    scenarios = list(list(
+      name = "CDD18_lambda0.9683_kappa1",
+      theta0 = 18,
+      slope = 1 / 0.9683,
+      kappa = 1
+    ))
   )
 )

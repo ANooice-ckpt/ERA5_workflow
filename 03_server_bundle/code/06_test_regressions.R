@@ -65,6 +65,31 @@ run_regressions <- function() {
   }
   check(max(abs(cp$cdd_year-scalar_cdd))<1e-12,"CDD agrees with independent daily scalar formula")
 
+  # Supplied SET-to-Ta conversion: delta_Ta = 0.9683 * delta_U, NOT delta_U/0.9683.
+  # Known shifts -12, 0, +12 SET degrees give threshold changes -11.6196, 0, +11.6196 C.
+  conversion_env <- new.env(parent=env)
+  conversion_env$fast_predict_ab <- function(cache,history) {
+    nr <- nrow(history)
+    list(A1=matrix(.1,nr,3L), B1=matrix(rep(c(-.2,1,2.2),each=nr),nr,3L),
+         A0=rep(.1,3L), B0=rep(1,3L))
+  }
+  conversion_compute <- fast_compute_tile
+  environment(conversion_compute) <- conversion_env
+  conversion_bundle <- bundle
+  conversion_bundle$g$cdd_scenarios <- list(list(
+    name="CDD18_lambda0.9683_kappa1",theta0=18,slope=1/0.9683,kappa=1))
+  conversion_out <- conversion_compute(task,conversion_bundle,file.path(tmp,"conversion_parts"),
+    file.path(tmp,"conversion_cp"),"synthetic-conversion")
+  conversion_cp <- fast_read_checkpoint(conversion_out$checkpoint,"synthetic-conversion",
+    task,conversion_bundle)
+  # Temperatures 28,30 and 27,24; independent hand-calculated yearly positive-part sums.
+  check(max(abs(conversion_cp$cdd_year[1,,1,1,1]-22))<1e-12 &&
+        max(abs(conversion_cp$cdd_year[1,,2,1,1]-15))<1e-12,
+        "18 C baseline is unchanged by conversion intercept or posterior draw")
+  check(max(abs(conversion_cp$cdd_year[1,,1,2,1]-c(45.2392,22,.3804)))<1e-12 &&
+        max(abs(conversion_cp$cdd_year[1,,2,2,1]-c(38.2392,15,0)))<1e-12,
+        "SET-to-Ta factor 0.9683 preserves paired signs and daily zero truncation")
+
   corruptions <- list(
     negative_cdd=function(z) {z$cdd_year[1,1,1,1,1]<- -1; z},
     negative_baseline=function(z) {z$cdd_all_weather[1,1,1,1]<- -1; z},
