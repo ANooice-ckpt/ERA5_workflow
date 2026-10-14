@@ -17,7 +17,15 @@ stopifnot(all(file.exists(inputs)),file.exists(file.path(cfg$remote$pack_dir,"pa
 stream_load_warm02(file.path(base,"warm02_reference.R"))
 source(file.path(base,"02_stream_overrides.R"))
 source(file.path(base,"09_parallel_runtime.R"))
-fast_stream_scheduling(cfg$run)
+scheduling <- fast_stream_scheduling(cfg$run)
+if(identical(scheduling$method,"memory_lpt")) {
+  index <- readRDS(file.path(cfg$remote$pack_dir,"pack_index.rds"))
+  g <- list(day_chunk=cfg$run$day_chunk,years=cfg$pack$years,cdd_scenarios=cfg$cdd$scenarios)
+  plan <- fast_stream_memory_plan(cfg$run,g,cfg$run$n_draws,index$tiles$n_cells)
+  message(sprintf("PRELIMINARY MEMORY PLAN (before models): CPU slots=%d, RAM=%.2f GiB, reserve=%.2f GiB, pool ceiling=%d, largest predicted worker=%.2f GiB. Rechecked after model loading and each worker initialization.",
+    plan$initial$cpu_slots,plan$initial$total_bytes/1024^3,plan$reserve_bytes/1024^3,
+    plan$workers,plan$largest_peak_bytes/1024^3))
+}
 problems <- character()
 if (any(!present)) problems <- c(problems,paste("Install missing R packages:",paste(needed[!present],collapse=", ")))
 scenario_error <- tryCatch({fast_stream_validate_scenarios(cfg$cdd$scenarios,2000L); NULL},

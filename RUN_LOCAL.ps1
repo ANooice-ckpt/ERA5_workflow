@@ -21,6 +21,8 @@ if ($Mode -eq 'test') {
     if ($LASTEXITCODE -ne 0) { throw 'Regression tests failed.' }
     & $rscript --vanilla (Join-Path $bundle 'code/10_test_parallel_runtime.R')
     if ($LASTEXITCODE -ne 0) { throw 'Parallel runtime tests failed.' }
+    & $rscript --vanilla (Join-Path $bundle 'code/12_test_memory_scheduler.R')
+    if ($LASTEXITCODE -ne 0) { throw 'Memory scheduler tests failed.' }
     exit 0
 }
 if ($Mode -eq 'pack') {

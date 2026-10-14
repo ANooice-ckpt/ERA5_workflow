@@ -1,84 +1,135 @@
-ERA5 server bundle
-==================
-将整个目录上传到 Linux ECS 的数据盘，保持 code / models / weather 结构。
-活动科学配置是 config.R。脚本自动使用当前 bundle 目录。
+ERA5 server bundle — memory-aware scheduler v2
+=============================================
+更新日期：2026-10-14。完整 Windows→Ubuntu 部署、正式运行和恢复命令见 DEPLOY_MEMORY.txt。
+此版本复用现有 models/、weather/，不要求重新传输约 7.64 GB 数据。
 
-准备
-----
-需要可恢复现有 brms 拟合对象的 R 环境、C++ 工具链，以及以下 R 包：
+状态与不变项
+------------
+依据用户提供的旧版 ECS 记录，Ubuntu 24.04 / EPYC 9T95 / R 4.5.3 已跑过真实模型，
+保留 14 个完整 Tile 检查点，其中 12 个 144 格点 Tile 有完整计时。
+平均 350.88 s/tile、2.437 worker-s/cell；worker 观测峰值 4.70/4.84 GiB、主进程 1.75 GiB。
+稀疏 pilot 的单 worker 约 0.5 GiB。以上是用户提供的观测，不是严格峰值上界。
+
+本轮修改执行调度、监测和测试；原 12×12 Tile、气象包/pack_index、M0/M1、2000 个配对、
+day_chunk=31、C++ 内核、支持域、热边界/逐日 CDD、科学检查点格式与 Tile-ID 汇总顺序保持不变。
+新版尚未在目标 32/128 或 64/256 ECS 实测，本地合成测试不能证明真实服务器性能或绝对无 OOM。
+
+环境与入口
+----------
+需要可恢复现有 brms 对象的 R 环境、C++ 工具链及：
 ncdf4, digest, Rcpp, brms, posterior, rstan, dlnm, FNN, splines。
-模型来源的包版本记录在 code/model_environment_versions.csv；它是历史环境记录，
-不是自动安装锁文件。原始拟合和服务器预测的数值 QC 仍由 03_run_ecs.R 执行。
+code/model_environment_versions.csv 是历史拟合记录，不是安装锁文件。
+原始模型数值 QC 及每个 worker 的预测一致性检查仍执行。
 
-config.R 已按 2026-10-12 的确认声明 CDD18_lambda0.9683_kappa1 情景：
-theta0=18°C，slope=1/0.9683，kappa=1。图片给出 ΔTa≈0.9683×ΔU，
-引擎使用 kappa/slope，故 slope 应填倒数；截距 0.583 在差值中抵消。
-kappa=1 是室内温度变化等量转移到室外 CDD 门槛的情景假设。
-逐日计算 CDD_M0=max(Ta_outdoor-18,0)、CDD_M1=max(Ta_outdoor-18-0.9683×ΔU,0) 后累加。
-固定换算系数沿用全部 2000 个配对抽样，不额外抽样；未包含系数自身的不确定性。
-预测前仍需核验预处理元数据并设置 preprocessing_acknowledged，以及通过真实模型数值 QC。
-当前 workers=32；根据实际内存、单 worker 峰值和试跑速度调整。
-默认 scheduling="lpt"：按 tile 中选中格点数降序派发，耗时相同时按 tile ID 排序。
-全部待算 tile 共用连续动态队列，空闲 worker 立即领取下一块，没有 2×workers 的批次屏障。
-这只是耗时估计；实际时间还取决于支持比例、CDD 情景数量和 I/O。
-可设置 scheduling="fifo" 做对照；两者均保留原 tile ID、固定抽样位置和最终 tile-ID 汇总顺序。
-LPT 会先同时运行大块，调整 workers 时应观察这段的内存峰值；每个 worker 的 BLAS/OpenMP 仍为 1 线程。
+config.R 保存现有科学配置；config_memory.R 继承它并覆盖执行参数与输出根目录。
+run_server.sh 默认使用 config_memory.R。pilot 使用 config_pilot.R，输出 results_memory_pilot。
+正式新版本输出 results_memory_v2，保留旧 results 及其 14 个基准检查点。
 
-命令（在本目录执行）
---------------------
+在 bundle 目录执行：
   bash run_server.sh check
-  bash run_server.sh pilot 2>&1 | tee logs/pilot.log
-  bash run_server.sh full 2>&1 | tee logs/full.log
+  bash run_server.sh full
   bash run_server.sh verify
+可选小规模端到端检查（仍不是性能基准）：
+  bash run_server.sh pilot
 
-check 检查静态文件 SHA256、合成数值回归、实际双 worker PSOCK 调度测试、十年气象包 MD5、模型文件存在性、
-依赖和情景配置。pilot 使用相同科学设置和 2000 个抽样位置，只计算前 300 个格点，
-结果写入 results_pilot；它用于端到端检查，不能当成全球结果或代表性速度估计。
-full 写入 results。shell 管道若用于自动作业，请先执行 set -o pipefail，保留失败退出码。
+check 执行静态 SHA256、50 项数值回归、27 项 PSOCK/合成执行与恢复测试、
+28 项内存调度测试（Linux 另加真实 /proc/cgroup 检查）、气象包验证、依赖/情景/资源预检。
+full 自动进行真实模型和逐 worker 数值 QC，通过后才派发科学任务；不需要另开多轮人工性能试验。
+如使用 tee 管道，先 set -o pipefail，保留失败退出码。
 
-续算
-----
-默认 resume="auto"：仅恢复未完成的同一版本运行；已完成运行不会重复启动。
-改变情景、代码、mask、tile 或其他科学设置后，使用 resume="new" 开始新运行。
-旧 v1 中途断点不能强行套用 v1.1 引擎。
-本次并行更新也改变了代码指纹，不能强行续接更新前的运行；现有本地气象包可直接复用。
-在本次版本内，仅改变 workers、scheduling 或 progress_seconds 不改变科学设置，可以续接同一未完成运行。
-某个 worker 报错后停止派发新任务，等待已派发任务返回并保留成功检查点，然后报告错误。
-进程崩溃或强制中断时，仍以已原子提交且验证通过的检查点为准。
-config_pilot.R 继承 config.R，仅修改格点上限和输出目录。
+少量执行配置（config_memory.R）
+------------------------------
+scheduling="memory_lpt"：启用内存感知 LPT + Backfilling。
+workers=64：固定进程池上限；CPU affinity/quota、RAM、剩余任务及初始化后内存可进一步限制。
+autotune=FALSE：不再为比较 worker 数而分批跑基准任务。
+memory$reserve_fraction=0.15：为系统及其他进程留至少 max(4 GiB,15%有效 RAM)。
+memory$safety_factor=1.30：对 worker 峰值估计及增长预留使用安全系数。
+memory$backfill=TRUE：允许较小任务利用内存空隙。
+progress_seconds=30：进度更新周期，memory_lpt 在无完成事件时也有轮询心跳。
+resume="auto"：仅续接同版本且指纹一致的未完成运行。
 
-运行进度与性能计时
-------------------
-results/run_*/global/progress.csv：已完成 tile/格点、吞吐量和剩余计算时间估计。
-progress_seconds=30 控制完成事件触发的更新频率；长时间没有 tile 完成时不会凭空更新进度。
-LPT 按大块优先运行，且不同地区支持比例不同，初期 ETA 只是估计；最终汇总时间不包含在 ETA 中。
-dispatch_<session>.csv：本次会话待派发队列，含 tile ID、派发排名和格点数成本估计。
-  遇到错误后，队列尾部可能尚未派发；实际完成情况以计时表和有效检查点为准。
-tile_timings_<session>.csv：每完成一块追加一行，包含 worker/PID、格点数、预测行数、
-  检查点字节数，以及读取、支持判断、预测、变换、CDD/warm 累加、汇总、检查点写入及回读校验的秒数。
-tile_timings/tile_XXXXX.rds：每块成功提交后的持久计时记录，含运行指纹。
-  分段时间是 worker 的墙钟时间，各段互不重叠；并行 worker 的秒数之和不是整个作业耗时。
-  total_seconds 包含气象文件关闭与检查点提交，不含随后写入这份小型计时报表的时间。
-  旧 cp$elapsed_seconds 为提交前计时，性能分析应使用新的计时报表。
-checkpoints/tile_XXXXX_error.rds：失败块的阶段、错误和截至失败时的计时。
-计时属于运行审计，不替代科学检查点，也不参与数值汇总。
+32 vCPU/128 GiB 可将 workers 设为 32；64 vCPU/256 GiB 设为 64。
+其余初始默认值相同。workers 是池上限，不是大型 Tile 的同时执行数量。
+scheduling="lpt" 或 "fifo" 可用于对照；这两个模式没有动态内存准入，需另行保守设置 workers。
 
-本次实现只涉及连续调度、LPT 和分段计时。worker 初始化、C++ 矩阵融合、kNN 搜索树复用、
-最终汇总 I/O 的进一步优化，留待目标 ECS 的分段计时确定瓶颈后处理。
+内存模型、准入与公平性
+----------------------
+初始完整 144 格点、31 天块、2000 draws、10 年、1 个 CDD 情景的未加安全系数估计为：
+0.75 GiB 常驻 + 0.25 GiB 年度数组 + 4 GiB 瞬时矩阵 = 5 GiB；乘 1.30 后为 6.5 GiB。
+年度部分随格点数、draws、年份和情景数变化，瞬时部分随格点数、day_chunk 和 draws 变化。
+4 GiB 是由有限实测构造的保守约 60 个 double 矩阵等效额度，不是精确对象内存清单。
+实际支持记录数写入计时/监测；平均支持率不能限制最密集时间块，所以内存仍按全支持估计。
+观察到超出估计的独立增长只会上调内存模型；低观测不会自动下调。高驻留前序 Tile 不用于拟合小 Tile 的峰值。
+耗时按小/中/大三组 seconds/cell 做简单平滑更新，不拟合复杂函数。
 
-文件与校验
+Linux 每秒左右读取当前 RSS、生命周期 VmHWM、MemAvailable、CPU affinity 与 cgroup v2 限制。
+有效 RAM/可用量还受当前及祖先 memory.max、memory.high、memory.current 限制；CPU 遵守 cpu.max。
+共享页面使 RSS 求和偏保守，VmHWM 属于进程生命周期，并非每个 Tile 的独立峰值。
+仅当 HWM 比派发前增加时，才把这个新增上界辅助记入当前任务；采样峰值仍可能漏掉短暂尖峰。
+
+每次派发都同时检查：
+  预计主进程额度 + 所有 worker 承诺额度 <= 有效 RAM - 系统预留；
+  主进程未来增长 + 所有 worker 尚未达到的峰值增长 <= MemAvailable/cgroup 余量 - 系统预留。
+主进程额度至少 max(2 GiB,当前主进程 RSS × 安全系数)。
+空闲 worker 的驻留内存仍计入；运行任务的预计峰值不因当前 RSS 较低而取消。
+优先复用已有高驻留 worker，避免无谓扩张更多独立 R 堆。
+
+主队列按预计耗时选任务；大 Tile 暂时不能准入时尝试小 Tile。
+被插队达到 8 次或等待 60 秒的大 Tile 获得预留，暂停继续插队，等待在途任务释放资源。
+已有任务运行但没有新任务可准入时继续轮询和收取结果，保留连续队列，没有固定批次屏障。
+完全空闲且仍无法准入时，仅向空闲 worker 请求一次 gc() 并重新测量。
+若仍不满足预算，明确失败退出，保留检查点供减少 workers 或释放内存后恢复；不会无限等待。
+没有动态创建/杀死正在计算的 worker，也不假定小 Tile 会使 R 释放前一块的大堆。
+
+失败、中断与恢复
+----------------
+worker 初始化按顺序进行，每个初始化前复查预算；失败时清理已创建连接。
+worker 计算错误、连接断开、回调/日志错误或监测不可用时，停止新派发，等待其他在途任务返回。
+监测失败不会静默降级到无内存约束的队列；有意使用 LPT 需要显式配置。
+进程级强制退出仍依赖既有原子提交机制，不能保证未提交 Tile 被保存。
+
+温和停止可在当前 run_*/STOP 创建空文件；调度器停止派发并排空。移除 STOP 后同命令恢复。
+详见 DEPLOY_MEMORY.txt 的准确命令。已完成的运行不会自动重做。
+检查点已经原子提交而 CSV/计时 sidecar 缺失时，恢复仍验证并跳过该 Tile，记录日志缺失即可。
+
+03_run_ecs.R 继续保留执行层内容 MD5，并新增 11_memory_resources.R 的 MD5。
+旧 14 个检查点不迁移、不修改指纹；本版本默认新结果根目录。
+同版本中 workers、scheduling、memory、progress_seconds 不进入科学身份，允许中断后调整；
+代码、数据、科学设置、后验配对、后端及 R/相关包环境变化仍接受严格指纹检查。
+
+输出和审计
 ----------
-weather/packed_2010.nc ... packed_2019.nc：原始 0.25° 气象值的稀疏提取，不插值。
-weather/pack_index.rds：格点索引、完整格点面积、人口、tile、日期和输入溯源。
-weather/packed_YYYY.done.rds：年度完成记录；selected_cells.csv / tiles.csv 便于浏览。
-SHA256SUMS.txt：代码、启动脚本、模型、pack_index 的内容校验。
-WEATHER_MD5SUMS.txt：十年 NetCDF 的内容校验，可执行 md5sum -c WEATHER_MD5SUMS.txt。
-可编辑的 config.R / config_pilot.R 不列入静态 SHA256，实际运行配置会记录在科学指纹内。
+results_memory_v2/run_*/global/：
+  checkpoints/tile_XXXXX.rds：原有逐格年度配对后验科学检查点。
+  progress.csv：有效完成计数、速率、ETA 估计依据和不确定性。
+  dispatch_<session>.csv：候选队列排序。真正派发次序/完成以 memory_dispatch 为准。
+  memory_dispatch_<session>.csv：派发/完成、Tile/格点、worker/PID、时间、状态、检查点大小；
+    predicted_* 为预测；sampled_task_peak_rss 为采样/新增 HWM 辅助观测；
+    process_lifetime_hwm_* 明确表示进程生命周期峰值，不冒充 Tile 独立峰值；
+    committed/reserved_future/headroom 为派发时预算；reason 为 LPT/回填/预留原因。
+  memory_monitor_<session>.csv：活跃/等待数量、被预留 Tile、可用内存、RSS 总和及未来增长预留。
+    telemetry_valid 和 sample_time 区分当前有效采样与监测故障后的旧读数。
+  resource_plan_<session>.rds：有效资源、初始池上限、保守参数和观测来源。
+  resume_<session>.csv：本会话已验证的旧检查点、格点数及计时 sidecar 是否存在。
+  tile_timings_<session>.csv、tile_timings/tile_XXXXX.rds：原有分阶段时间与持久计时。
+ETA 用剩余 Tile 大小分组成本和按时间加权的观测并行度，初期有明确不确定性；不扣除活动 Tile 已完成比例，
+不包括最终汇总和未来外部内存压力变化。它是规划估计，不是运行时保证。
 
-输出与取回
-----------
-results/run_*/global/：全域汇总、元数据、grid_partitions、checkpoints。
-下载整个 results 到本地 ERA5_workflow/04_results；不要遗漏 checkpoints。
-全球 CDD schema 为 v2：无合格数据的期次输出 NA 和 no_eligible_support 状态。
-CDD 单位为 °C·day，面积加总单位为 km²·°C·day；不是电力消耗。
-真实模型和 ECS 性能试跑尚未由此次本地预处理完成。
+文件与科学配置
+--------------
+weather/packed_2010.nc ... packed_2019.nc、pack_index.rds、年度完成记录和格点清单均复用。
+SHA256SUMS.txt 校验静态代码/说明/模型/pack_index；WEATHER_MD5SUMS.txt 校验年度 NetCDF。
+config.R、config_memory.R、config_pilot.R 可编辑，运行时科学配置仍记录到指纹。
+
+原 CDD 情景保留 theta0=18、slope=1/0.9683、kappa=1。
+每日 CDD_M0=max(Ta_outdoor-18,0)、CDD_M1=max(Ta_outdoor-18-0.9683×ΔU,0)，先逐日截断再累计；
+kappa=1 是室内变化等量转移到室外门槛的情景，截距不进入差值。
+CDD 单位为 °C·day，面积加总为 km²·°C·day，不是耗电量。
+
+下载整个 results_memory_v2 到本地 04_results，保留 global/checkpoints、grid_partitions、后验及运行元数据。
+现有预处理确认开关被入口硬编码覆盖的问题在 DEPLOY_MEMORY.txt 单独记录，本次未改动这一历史科学行为。
+
+监测/API 依据：
+https://docs.kernel.org/filesystems/proc.html
+https://docs.kernel.org/admin-guide/cgroup-v2.html
+https://stat.ethz.ch/R-manual/R-devel/library/base/html/socketSelect.html

@@ -3,15 +3,17 @@
 # fixed draw IDs and final tile-ID reduction follow warm02_reference.R unchanged.
 # R parallel's sendCall/recvOneResult are internal APIs, isolated and exercised
 # by 10_test_parallel_runtime.R on the installed R version before production.
+sys.source(file.path(stream_this_dir(),"11_memory_resources.R"),envir=environment())
 
 fast_stream_scheduling <- function(fast) {
   method <- if (is.null(fast$scheduling)) "lpt" else fast$scheduling
   interval <- if (is.null(fast$progress_seconds)) 30 else fast$progress_seconds
   if (!is.character(method) || length(method)!=1L || is.na(method) ||
-      !method %in% c("lpt","fifo")) stop("fast$scheduling must be 'lpt' or 'fifo'.")
+      !method %in% c("lpt","fifo","memory_lpt")) stop("fast$scheduling must be 'lpt', 'fifo' or 'memory_lpt'.")
   if (!is.numeric(interval) || length(interval)!=1L || !is.finite(interval) || interval<=0)
     stop("fast$progress_seconds must be positive.")
-  list(method=method,progress_seconds=interval,version="continuous-psock-v1")
+  list(method=method,progress_seconds=interval,version="memory-psock-v2",
+       memory=fast_stream_memory_settings(fast$memory))
 }
 
 fast_stream_order_tiles <- function(ids,cell_counts,method="lpt") {
@@ -19,8 +21,8 @@ fast_stream_order_tiles <- function(ids,cell_counts,method="lpt") {
       any(ids<1L | ids>length(cell_counts)) || anyDuplicated(ids) ||
       any(!is.finite(cell_counts[ids]) | cell_counts[ids]<=0)) stop("Invalid scheduling IDs/costs.")
   ids <- as.integer(ids)
-  if (!method %in% c("lpt","fifo")) stop("Unknown scheduling method.")
-  if (method=="lpt") ids[order(-cell_counts[ids],ids)] else ids
+  if (!method %in% c("lpt","fifo","memory_lpt")) stop("Unknown scheduling method.")
+  if (method!="fifo") ids[order(-cell_counts[ids],ids)] else ids
 }
 
 fast_stream_append_csv <- function(row,path) {
@@ -55,7 +57,7 @@ fast_stream_task_envelope <- function(task,fun) {
     list(ok=FALSE,tile_id=task$tile_id,message=conditionMessage(e)))
 }
 
-fast_stream_queue <- function(cl,tasks,fun,on_result=function(...) NULL) {
+fast_stream_queue <- function(cl,tasks,fun,on_result=function(...) NULL,control=NULL) {
   n <- length(tasks); workers <- length(cl)
   if (!n) return(invisible(list()))
   if (!workers) stop("Continuous queue requires at least one worker.")
@@ -63,40 +65,192 @@ fast_stream_queue <- function(cl,tasks,fun,on_result=function(...) NULL) {
   if (anyNA(ids) || anyDuplicated(ids)) stop("Queue task IDs must be unique.")
   send <- getFromNamespace("sendCall","parallel")
   receive <- getFromNamespace("recvOneResult","parallel")
-  active <- rep(NA_integer_,workers); next_job <- 1L
+  active <- rep(NA_integer_,workers); pending <- seq_len(n); live <- rep(TRUE,workers)
   result <- vector("list",n); failures <- character(); failure_announced <- FALSE
-  submit <- function(node) {
-    j <- next_job; next_job <<- next_job+1L
-    send(cl[[node]],fast_stream_task_envelope,list(tasks[[j]],fun),tag=j)
-    active[node] <<- j
-  }
-  for (node in seq_len(min(workers,n))) submit(node)
-  while (any(!is.na(active))) {
-    received <- receive(cl)
-    node <- received$node; j <- received$tag
-    if (length(node)!=1L || is.na(node) || node<1L || node>workers ||
-        length(j)!=1L || is.na(j) || is.na(active[node]) || active[node]!=j)
-      stop("Continuous queue received an invalid worker/tag.")
-    active[node] <- NA_integer_
-    value <- received$value
-    if (is.list(value) && isTRUE(value$ok)) {
-      error <- tryCatch({
-        on_result(value$value,tasks[[j]],node,j)
-        NULL
-      },error=function(e) conditionMessage(e))
-      if (is.null(error)) result[j] <- list(value$value) else
-        failures <- c(failures,paste0("tile ",ids[j]," callback: ",error))
-    } else {
-      msg <- if (is.list(value) && is.character(value$message)) value$message else as.character(value)
-      failures <- c(failures,paste0("tile ",ids[j],": ",paste(msg,collapse=" ")))
+  aware <- !is.null(control); poll <- if(aware) control$poll_seconds else .1
+  started <- rep(NA_real_,n); started_at <- vector("list",n); sampled_peak <- rep(NA_real_,n)
+  start_rss <- hwm_before <- rep(NA_real_,n); peaks <- numeric(workers)
+  bypasses <- integer(n); blocked_at <- rep(NA_real_,n); reserved <- NA_integer_
+  cleaned_idle <- rep(FALSE,workers); ranks <- integer(n); dispatched <- 0L
+  snapshot <- budget <- NULL; retained <- numeric(workers); estimates <- vector("list",n)
+  telemetry_valid <- FALSE
+  now <- function() unname(proc.time()[["elapsed"]])
+  fail <- function(msg) failures <<- unique(c(failures,msg))
+  refresh <- function() {
+    if(!aware) return(TRUE)
+    sample <- tryCatch(control$sample(control$pids),error=function(e) list(ok=FALSE,reason=conditionMessage(e)))
+    if(!isTRUE(sample$ok)) {
+      telemetry_valid <<- FALSE
+      fail(paste0("Memory monitoring unavailable; dispatch paused: ",sample$reason))
+      return(FALSE)
     }
-    if (length(failures) && !failure_announced && any(!is.na(active))) {
-      message("Queue stopped dispatching after an error; waiting for running tiles to commit.")
+    snapshot <<- sample
+    telemetry_valid <<- TRUE
+    retained <<- pmax(retained,snapshot$worker_rss)
+    for(node in which(!is.na(active))) {
+      j <- active[node]
+      sampled_peak[j] <<- max(sampled_peak[j],snapshot$worker_rss[node],na.rm=TRUE)
+      updated <- fast_stream_resource_estimate(control$model,nrow(tasks[[j]]$tile_points),
+        control$plan$settings$safety_factor)$peak_bytes
+      peaks[node] <<- max(peaks[node],updated,snapshot$worker_rss[node]*control$plan$settings$safety_factor)
+    }
+    budget <<- fast_stream_memory_budget(snapshot,retained,peaks,control$plan$reserve_bytes,
+      control$plan$settings$safety_factor)
+    TRUE
+  }
+  if(aware) {
+    if(length(control$pids)!=workers) stop("Memory controller PID count differs from cluster.")
+    if(!refresh()) stop(paste(failures,collapse="; "))
+    retained <- snapshot$worker_rss*control$plan$settings$safety_factor
+    refresh()
+  }
+  audit <- function(event,j,node,reason,status,answer=NULL) {
+    if(!aware || is.null(snapshot) || is.null(budget)) return(invisible(NULL))
+    fast_stream_memory_audit(control,event,ranks[j],node,tasks[[j]],estimates[[j]],snapshot,budget,
+      sum(!is.na(active)),reason,status,started=started_at[[j]],
+      seconds=if(event=="dispatch") NA_real_ else now()-started[j],peak=sampled_peak[j],
+      hwm_before=hwm_before[j],checkpoint_bytes=if(is.null(answer$timing$checkpoint_bytes))
+        NA_real_ else answer$timing$checkpoint_bytes,telemetry_valid=telemetry_valid)
+  }
+  submit <- function(j,node,reason) {
+    pending <<- setdiff(pending,j); active[node] <<- j
+    started[j] <<- now(); started_at[[j]] <<- Sys.time()
+    dispatched <<- dispatched+1L; ranks[j] <<- dispatched
+    tryCatch({
+      if(aware) {
+        peaks[node] <<- estimates[[j]]$peak_bytes
+        start_rss[j] <<- snapshot$worker_rss[node]; sampled_peak[j] <<- start_rss[j]
+        hwm_before[j] <<- snapshot$worker_hwm[node]; cleaned_idle[node] <<- FALSE
+        budget <<- fast_stream_memory_budget(snapshot,retained,peaks,control$plan$reserve_bytes,
+          control$plan$settings$safety_factor)
+        audit("dispatch",j,node,reason,"running")
+      }
+      send(cl[[node]],fast_stream_task_envelope,list(tasks[[j]],fun),tag=j)
+    },error=function(e) {
+      active[node] <<- NA_integer_; live[node] <<- FALSE; peaks[node] <<- 0
+      fail(paste0("tile ",ids[j]," send/audit failed: ",conditionMessage(e)))
+    })
+  }
+  receive_ready <- function(node) {
+    j <- active[node]
+    received <- tryCatch(receive(cl[node]),error=function(e)e)
+    if(inherits(received,"error")) {
+      active[node] <<- NA_integer_; live[node] <<- FALSE; peaks[node] <<- 0
+      fail(paste0("tile ",ids[j]," worker disconnected: ",conditionMessage(received)))
+      audit("complete",j,node,"worker_disconnected","failed")
+      return(invisible(NULL))
+    }
+    if(length(received$tag)!=1L || is.na(received$tag) || received$tag!=j) {
+      fail("Continuous queue received an invalid worker/tag.")
+      active[node] <<- NA_integer_; peaks[node] <<- 0
+      return(invisible(NULL))
+    }
+    if(aware) {
+      refresh()
+      # HWM sharpens this observation only when a NEW lifetime maximum occurred.
+      if(is.finite(snapshot$worker_hwm[node]) && snapshot$worker_hwm[node]>hwm_before[j])
+        sampled_peak[j] <<- max(sampled_peak[j],snapshot$worker_hwm[node])
+    }
+    active[node] <<- NA_integer_; peaks[node] <<- 0
+    value <- received$value
+    if(is.list(value) && isTRUE(value$ok)) {
+      err <- tryCatch({on_result(value$value,tasks[[j]],node,j); NULL},error=function(e)conditionMessage(e))
+      if(is.null(err)) result[j] <<- list(value$value) else fail(paste0("tile ",ids[j]," callback: ",err))
+      if(aware) {
+        fast_stream_memory_learn(control$model,nrow(tasks[[j]]$tile_points),now()-started[j],
+          sampled_peak[j],start_rss[j],value$value$timing,control$plan$settings$safety_factor)
+        refresh()
+        audit("complete",j,node,"worker_result",if(is.null(err)) "committed" else "callback_failed",value$value)
+      }
+    } else {
+      msg <- if(is.list(value) && is.character(value$message)) value$message else as.character(value)
+      fail(paste0("tile ",ids[j],": ",paste(msg,collapse=" ")))
+      audit("complete",j,node,"worker_error","failed")
+    }
+  }
+  step <- function() {
+    if(aware) {
+      refresh()
+      if(!is.null(control$stop_file) && file.exists(control$stop_file))
+        fail("Cooperative STOP requested; running tasks drained.")
+    }
+    while(length(pending) && any(is.na(active) & live) && !length(failures)) {
+      idle <- which(is.na(active) & live)
+      if(aware) {
+        if(!refresh()) break
+        for(j in pending) estimates[[j]] <<- fast_stream_resource_estimate(control$model,
+          nrow(tasks[[j]]$tile_points),control$plan$settings$safety_factor)
+        aged <- pending[!is.na(blocked_at[pending]) &
+          (now()-blocked_at[pending]>=control$starvation_seconds | bypasses[pending]>=control$max_bypasses)]
+        if(is.na(reserved) && length(aged)) reserved <<- aged[which.min(blocked_at[aged])]
+        choice <- fast_stream_memory_choose(pending,idle,estimates,budget,retained,ids,
+          control$plan$settings$backfill,reserved)
+        if(is.null(choice)) {
+          if(!any(!is.na(active))) {
+            # GC is requested only on idle workers. Never assume that it frees RSS.
+            clean <- idle[!cleaned_idle[idle]]
+            if(length(clean)) {
+              for(node in clean) {
+                tryCatch(parallel::clusterCall(cl[node],function() {gc(full=TRUE); NULL}),
+                  error=function(e) fail(paste0("Idle worker GC failed: ",conditionMessage(e))))
+                cleaned_idle[node] <<- TRUE
+              }
+              if(refresh()) retained[idle] <<- snapshot$worker_rss[idle]*control$plan$settings$safety_factor
+              next
+            }
+            fail(paste0("No admissible tile with no active work (budget/retained RSS). ",
+              "Increase free RAM or resume with a smaller worker cap. Checkpoints retained."))
+          }
+          break
+        }
+        if(choice$job!=choice$head) {
+          j <- choice$head; bypasses[j] <<- bypasses[j]+1L
+          if(is.na(blocked_at[j])) blocked_at[j] <<- now()
+        }
+        if(identical(choice$job,reserved)) reserved <<- NA_integer_
+        submit(choice$job,choice$node,choice$reason)
+      } else submit(pending[1L],idle[1L],"legacy_queue")
+    }
+    if(aware && is.function(control$on_tick)) control$on_tick(sum(!is.na(active)))
+    nodes <- which(!is.na(active))
+    if(length(nodes)) {
+      ready <- tryCatch(socketSelect(lapply(cl[nodes],function(x)x$con),timeout=poll),error=function(e)e)
+      if(inherits(ready,"error")) {
+        # Identify broken connections without dropping other workers' commits.
+        ready <- logical(length(nodes))
+        for(k in seq_along(nodes)) {
+          probe <- tryCatch(socketSelect(list(cl[[nodes[k]]]$con),timeout=0),error=function(e)e)
+          if(inherits(probe,"error")) {
+            node <- nodes[k]; fail(paste("Worker socket failed:",conditionMessage(probe)))
+            active[node] <<- NA_integer_; peaks[node] <<- 0; live[node] <<- FALSE
+          } else ready[k] <- probe[1L]
+        }
+      }
+      # Drain already-ready failures before admitting another task.
+      for(node in nodes[ready]) receive_ready(node)
+    }
+    if(aware && !is.null(snapshot) && !is.null(budget)) {
+      if(!is.null(control$monitor_file)) fast_stream_append_csv(data.frame(time=as.character(Sys.time()),
+        telemetry_valid=telemetry_valid,sample_time=as.character(snapshot$measured_at),
+        active_tasks=sum(!is.na(active)),pending_tasks=length(pending),
+        reserved_tile_id=if(is.na(reserved)) NA_integer_ else ids[reserved],
+        available_bytes=snapshot$available_bytes,committed_bytes=budget$committed,
+        measured_process_rss_sum_bytes=snapshot$master_rss+sum(snapshot$worker_rss),
+        reserved_future_bytes=budget$future,headroom_bytes=budget$headroom,
+        memory_scale=control$model$memory_scale,observed_support_fraction=control$model$support_fraction,
+        status=if(length(failures)) "draining" else "running"),control$monitor_file)
+      if(is.function(control$on_tick)) control$on_tick(sum(!is.na(active)))
+    }
+  }
+  while(length(pending) || any(!is.na(active))) {
+    if(length(failures) && !failure_announced) {
+      message("Queue stopped dispatching; waiting for running tiles to commit: ",failures[1L])
       failure_announced <- TRUE
     }
-    # On error, drain outstanding work and retain all successful commits. Never
-    # silently drop an error, retry within this session, or enqueue fresh tasks.
-    if (!length(failures) && next_job<=n) submit(node)
+    if(length(failures) && !any(!is.na(active))) break
+    # First Ctrl+C requests a drain; subsequent interrupts are deferred until drained.
+    tryCatch(if(length(failures)) suspendInterrupts(step()) else step(),
+      interrupt=function(e) fail("Interrupted; running tasks drained."),error=function(e) fail(conditionMessage(e)))
   }
   if (length(failures)) stop("Continuous queue failed; committed tiles can be resumed. ",
     paste(unique(failures),collapse="; "),call.=FALSE)
@@ -107,6 +261,10 @@ run_global_era5 <- function(config, analysis = NULL) {
   if (!requireNamespace("ncdf4", quietly = TRUE)) stop("Install ncdf4 before global analysis.")
   g <- global_defaults(config); f <- fast_defaults(config)
   scheduling <- fast_stream_scheduling(config$fast)
+  memory_mode <- identical(scheduling$method,"memory_lpt")
+  if(memory_mode && isTRUE(f$autotune)) stop("Use autotune=FALSE with memory_lpt; admission already adapts continuously.")
+  resource_plan <- NULL; memory_control <- NULL; concurrency_sum <- 0; concurrency_samples <- 0
+  concurrency_last <- NULL; concurrency_active <- 0L
   if (is.null(analysis)) analysis <- load_analysis(config)
   if (isTRUE(g$joint_support) && is.null(analysis$joint_reference))
     stop("Global joint support requires the original cached training reference.")
@@ -259,10 +417,19 @@ run_global_era5 <- function(config, analysis = NULL) {
     basename(tempfile("session_",tmpdir=out_dir)))
   dispatch_file <- file.path(out_dir,paste0("dispatch_",session_id,".csv"))
   timing_file <- file.path(out_dir,paste0("tile_timings_",session_id,".csv"))
+  resume_audit <- data.frame(tile_id=which(done),n_cells=cell_counts[done],status=rep("validated_existing",sum(done)),
+    timing_sidecar_present=file.exists(file.path(out_dir,"tile_timings",sprintf("tile_%05d.rds",which(done)))))
+  # A validated scientific checkpoint remains authoritative even if a timing CSV/sidecar was lost.
+  if(any(done)) utils::write.csv(resume_audit,file.path(out_dir,paste0("resume_",session_id,".csv")),row.names=FALSE)
   record_progress <- function(label, workers, seconds = NA_real_, new_cells = 0L) {
     elapsed <- as.numeric(difftime(Sys.time(), start, units = "secs"))
     remaining <- sum(cell_counts[!done])
     eta <- if (remaining == 0) 0 else if (is.finite(rate) && rate > 0) remaining / rate else NA_real_
+    if(memory_mode && !is.null(resource_plan) && remaining>0 && concurrency_samples>0L) {
+      remaining_seconds <- sum(vapply(cell_counts[!done],function(n)
+        fast_stream_resource_estimate(resource_plan$model,n,resource_plan$settings$safety_factor)$seconds,numeric(1)))
+      eta <- remaining_seconds/max(1,concurrency_sum/concurrency_samples)
+    }
     row <- data.frame(time = as.character(Sys.time()), phase = label, backend = backend, workers = workers,
       completed_tiles = sum(done), total_tiles = length(tasks), completed_land_points = sum(cell_counts[done]),
       total_land_points = sum(cell_counts), seconds_this_wave = seconds, land_points_this_wave = new_cells,
@@ -270,17 +437,19 @@ run_global_era5 <- function(config, analysis = NULL) {
       estimated_remaining_compute_hours = eta / 3600,
       estimated_remaining_recent_hours = if (remaining==0) 0 else if (is.finite(seconds) && seconds>0 && new_cells>0) remaining/(new_cells/seconds)/3600 else NA_real_,
       elapsed_from_launch_hours = as.numeric(difftime(Sys.time(), .warm_session_started, units="hours")),
-      projected_total_session_hours_excluding_finalize = as.numeric(difftime(Sys.time(), .warm_session_started, units="hours")) + eta/3600)
+      projected_total_session_hours_excluding_finalize = as.numeric(difftime(Sys.time(), .warm_session_started, units="hours")) + eta/3600,
+      eta_basis=if(memory_mode) "remaining tile-size costs / sampled active concurrency; active tile residuals conservatively uncredited" else "session observed throughput",
+      eta_uncertainty=if(sum(done)-initial_done<20L) "high: initial priors/few tiles; geography and support vary" else "approximate: excludes finalization and changing external memory load")
     progress[[length(progress) + 1L]] <<- row
     utils::write.csv(do.call(rbind, progress), file.path(out_dir, "progress.csv"), row.names = FALSE)
     last_progress <<- unname(proc.time()[["elapsed"]])
     message("Progress ", sum(done), "/", length(tasks), " tiles, ", sum(cell_counts[done]), "/", sum(cell_counts),
       " land points; ", workers, " workers; remaining compute ~",
       if (is.finite(eta)) sprintf("%.2f h", eta / 3600) else "pending benchmark",
-      ". ETA includes measured queue compute/read/write time; excludes final aggregation/plots and may change with geography/I/O.")
+      ". ETA is approximate, especially early; tile size/support and memory pressure vary; excludes final aggregation/plots.")
     if (is.finite(eta) && remaining>0) {
       forecast <- row$projected_total_session_hours_excluding_finalize
-      message(sprintf("Measured forecast for this session: %.2f h including elapsed setup, excluding final aggregation/plots.", forecast))
+      message(sprintf("Approximate forecast for this session: %.2f h including elapsed setup, excluding final aggregation/plots.", forecast))
       if (is.finite(f$target_total_hours) && forecast > f$target_total_hours)
         message("Current measured speed exceeds the ", f$target_total_hours, " h planning target; calculation continues without reducing draws or dates.")
     }
@@ -293,10 +462,19 @@ run_global_era5 <- function(config, analysis = NULL) {
     physical <- suppressWarnings(parallel::detectCores(logical = FALSE))
     if (is.finite(physical) && physical > 0) candidates <- pmin(candidates, as.integer(physical))
     candidates <- sort(unique(pmin(candidates, sum(!done))))
+    if(memory_mode) {
+      resource_plan <- fast_stream_memory_plan(f,g,ndraw,cell_counts[!done])
+      candidates <- resource_plan$workers
+      saveRDS(list(workers=candidates,settings=resource_plan$settings,initial=resource_plan$initial,
+        reserve_bytes=resource_plan$reserve_bytes,largest_peak_bytes=resource_plan$largest_peak_bytes,
+        prior="User-reported EPYC 9T95 measurements; estimates, NOT guaranteed memory bounds"),
+        file.path(out_dir,paste0("resource_plan_",session_id,".rds")))
+      message(sprintf("Memory plan: %d CPU slots, %.2f GiB effective RAM, %.2f GiB reserve; pool <= %d, full-tile predicted peak %.2f GiB. Active concurrency is admitted separately.",
+        resource_plan$initial$cpu_slots,resource_plan$initial$total_bytes/1024^3,
+        resource_plan$reserve_bytes/1024^3,candidates,resource_plan$largest_peak_bytes/1024^3))
+    }
     chosen_workers <- candidates[1L]
     .set_analysis_stage("start_PSOCK_workers", workers = max(candidates), announce = TRUE)
-    cl <- parallel::makePSOCKcluster(max(candidates), rscript_args = "--vanilla",
-      outfile = file.path(out_dir, "worker_log.txt"))
     source_env <- environment(run_global_era5)
     symbols <- ls(envir = source_env, all.names = TRUE)
     fast_functions <- symbols[grepl("^(fast_|[.]fast_)", symbols) &
@@ -305,15 +483,48 @@ run_global_era5 <- function(config, analysis = NULL) {
       ".history_frame", ".b21_basis", ".tv_basis", "make_history_design", ".make_joint_reference",
       "history_support", "evaluate_support", "normal_axis", "read_rectangular_history", "sum_by_cell",
       "posterior_rows", ".set_analysis_stage", ".analysis_error_details"))
-    parallel::clusterExport(cl, exports, envir = source_env)
     qc_history <- .fast_qc_histories(analysis)$training
     qc_history <- qc_history[seq_len(min(2L, nrow(qc_history))), , drop = FALSE]
     qc_expected <- fast_predict_ab(cache, qc_history)[c("A1", "B1", "A0", "B0")]
-    worker_audit <- vector("list", length(cl))
-    # Serial initialization prevents competing sourceCpp cache writes.
-    for (i in seq_along(cl)) worker_audit[[i]] <- parallel::clusterCall(cl[i], fast_worker_initialize,
-      .libPaths(), cache_dir, backend, bundle, part_dir, checkpoint_dir, fingerprint, qc_history, qc_expected)[[1L]]
-    fast_register_workers(config$output_dir, worker_audit)
+    # Create/export/initialize one worker at a time. A failed initializer cleans up
+    # every already-created connection; registration happens after each successful QC.
+    initialize <- function(node,i) {
+      parallel::clusterExport(node,exports,envir=source_env)
+      parallel::clusterCall(node,fast_worker_initialize,.libPaths(),cache_dir,backend,bundle,
+        part_dir,checkpoint_dir,fingerprint,qc_history,qc_expected)[[1L]]
+    }
+    can_start <- function(audit) {
+      if(!memory_mode) return(TRUE)
+      pids <- vapply(audit,function(x) as.integer(x$pid),integer(1))
+      s <- fast_stream_resources(pids)
+      if(!isTRUE(s$ok)) stop("Worker initialization memory monitoring unavailable: ",s$reason)
+      b <- fast_stream_memory_budget(s,s$worker_rss*resource_plan$settings$safety_factor,
+        numeric(length(pids)),resource_plan$reserve_bytes,resource_plan$settings$safety_factor)
+      required <- max(1.5*1024^3*resource_plan$settings$safety_factor,
+        resource_plan$idle_prior_bytes+resource_plan$largest_peak_bytes)
+      b$headroom>=required
+    }
+    pool <- fast_stream_start_pool(max(candidates),initialize,
+      function(audit) fast_register_workers(config$output_dir,list(audit)),can_start,
+      outfile=file.path(out_dir,"worker_log.txt"))
+    cl <- pool$cluster; worker_audit <- pool$audit
+    candidates <- pmin(candidates,length(cl)); chosen_workers <- candidates[1L]
+    if(memory_mode) {
+      memory_control <- fast_stream_memory_control(resource_plan,
+        vapply(worker_audit,function(x) as.integer(x$pid),integer(1)),out_dir,session_id,
+        file.path(config$output_dir,"STOP"))
+      memory_control$on_tick <- function(active) {
+        tick <- unname(proc.time()[["elapsed"]])
+        if(!is.null(concurrency_last)) {
+          dt <- tick-concurrency_last
+          concurrency_sum <<- concurrency_sum+concurrency_active*dt
+          concurrency_samples <<- concurrency_samples+dt
+        }
+        concurrency_last <<- tick; concurrency_active <<- active
+        if(unname(proc.time()[["elapsed"]])-last_progress>=progress_interval)
+          record_progress("memory_queue",chosen_workers)
+      }
+    }
     saveRDS(worker_audit, file.path(out_dir, "worker_QC.rds"))
     message("All ", length(cl), " workers passed prediction QC; backend=", backend,
             ". Complete production tiles will be used for speed measurement.")
@@ -340,7 +551,7 @@ run_global_era5 <- function(config, analysis = NULL) {
         if (unname(proc.time()[["elapsed"]])-last_progress >= progress_interval || all(done))
           record_progress(phase,workers,seconds,completed_cells)
       }
-      fast_stream_queue(cl[seq_len(workers)],tasks[ids],fast_worker_task,on_result)
+      fast_stream_queue(cl[seq_len(workers)],tasks[ids],fast_worker_task,on_result,memory_control)
       seconds <- unname(proc.time()[["elapsed"]])-t0
       list(seconds=seconds,cells=completed_cells,rate=completed_cells/max(seconds,.001))
     }
@@ -395,8 +606,11 @@ run_global_era5 <- function(config, analysis = NULL) {
   }
   cache_completion <- fast_daily_finalize_inventory(bundle, tasks, fingerprint, out_dir)
   execution <- list(backend = backend, selected_workers = chosen_workers, benchmark = benchmark,
-    scheduling = scheduling, scheduling_cost_proxy = "selected cells per tile; not measured runtimes",
+    scheduling = scheduling, scheduling_cost_proxy = if(memory_mode)
+      "size-bucket seconds/cell updated per completion; conservative full-support matrix memory prior" else "selected cells per tile",
     dispatch_log = dispatch_file, tile_timing_log = timing_file,
+    memory_dispatch_log=if(is.null(memory_control)) NULL else memory_control$audit_file,
+    memory_monitor_log=if(is.null(memory_control)) NULL else memory_control$monitor_file,
     daily_cache_completion = cache_completion,
     fingerprint = fingerprint, checkpoint_schema = "ERA5-warm02-tile-v1",
     resumed_tiles = initial_done, total_tiles = length(tasks), total_land_points = sum(cell_counts),

@@ -1,0 +1,147 @@
+ERA5 memory scheduler v2 — incremental deployment, 2026-10-14
+=============================================================
+以下命令沿用已经上传到 ECS 的 models/ 和 weather/；不需要重新传输约 7.64 GB 输入。
+本次没有远程登录、启动 ECS 计算、修改云资源或覆盖旧结果。
+仅有当前本地配置的机器需先准备科学配置；已有服务器的 config.R 会原样保留。
+
+1. Windows 打包及传输
+--------------------
+在 E:\ERA5\ERA5_workflow 的 PowerShell 中执行：
+
+  .\BUILD_CODE_UPDATE.ps1
+  $ecsHost = 'ubuntu@YOUR_ECS_IP'
+  scp .\02_local\audit\era5_memory_v2_code_update.tar.gz "${ecsHost}:~/era5_memory_v2_code_update.tar.gz"
+  ssh $ecsHost
+
+将 ubuntu@YOUR_ECS_IP 替换为实际 SSH 用户和地址。若使用密钥，在 scp/ssh 后加 -i '密钥路径'。
+压缩包只含代码、执行配置、说明、校验清单；不包含 config.R、模型、气象数据或结果。
+
+2. Ubuntu 解包、备份和安装
+------------------------
+先确认旧计算进程已经退出。不要在模型计算仍运行时更换代码。
+以下 ERA5_DIR 必须改为现有服务器 bundle 的绝对目录；不要指向 results/。
+在同一个 SSH 会话中执行：
+
+  set -euo pipefail
+  ERA5_DIR=/data/era5
+  cd -- "$ERA5_DIR"
+  test -f config.R && test -d models && test -d weather
+  stage_dir=$(mktemp -d "$ERA5_DIR/.code_update_20261014.XXXXXX")
+  tar -xzf ~/era5_memory_v2_code_update.tar.gz -C "$stage_dir"
+  (cd "$stage_dir" && sha256sum -c UPDATE_SHA256SUMS.txt)
+  backup_dir=$(mktemp -d "$ERA5_DIR/.code_backup_20261014.XXXXXX")
+  for item in code config.R config_pilot.R config_memory.R run_server.sh README_SERVER.txt DEPLOY_MEMORY.txt SHA256SUMS.txt WEATHER_MD5SUMS.txt; do
+    if [ -e "$item" ]; then cp -a -- "$item" "$backup_dir/"; fi
+  done
+  mkdir -p code logs
+  cp -a -- "$stage_dir/code/." code/
+  for item in config_memory.R config_pilot.R run_server.sh README_SERVER.txt DEPLOY_MEMORY.txt SHA256SUMS.txt WEATHER_MD5SUMS.txt; do
+    cp -a -- "$stage_dir/$item" "$item"
+  done
+  printf 'Old code and configuration backup: %s\n' "$backup_dir"
+
+上面的复制清单不覆盖 config.R、models/、weather/、旧 results/ 或任何检查点。
+暂存目录和旧代码备份保留用于审计，不含复制的大型科研数据。
+勿从旧 results 中搬入 14 个旧版本检查点：执行文件指纹已变更，禁止绕过验证。
+
+3. 初始配置与一次自动预检
+------------------------
+config_memory.R 读取现有 config.R 的全部科学参数，仅覆盖执行设置和输出根目录。
+默认 scheduling="memory_lpt"、workers=64（进程池上限）、autotune=FALSE、resume="auto"。
+memory$reserve_fraction=0.15（至少留 4 GiB，另留主进程额度），safety_factor=1.30，backfill=TRUE。
+
+初始建议（是保守估计，未在这两种 ECS 上实测）：
+  32 vCPU / 128 GiB：workers=32，reserve_fraction=0.15，safety_factor=1.30，backfill=TRUE。
+  64 vCPU / 256 GiB：workers=64，其余同上。
+默认上限 64 在 32 vCPU 机器上也会自动降至可用 CPU 数；这不是同时启动 32/64 个大 Tile 的指令。
+池大小在加载模型和每个 worker 初始化后根据实际内存复查；同时执行数由实时准入决定。
+若空闲 worker 保留过多 RSS、GC 后仍无任务能准入，程序会明确退出；降低 workers 后可原目录续算。
+
+保留已有科学配置，确认 full 对应的 config.R$run$max_cells 为 NULL、day_chunk=31、
+backend="cpp"、n_draws=2000，以及现有 CDD/支持域设置。不要为了通过测试修改科学阈值。
+已知历史实现问题：03_run_ecs.R 仍直接将内部 global$preprocessing_acknowledged 设为 TRUE，
+没有使用外层同名开关；这是既有行为，本次未混入科学层修改，不能把它当成元数据已人工核验的证据。
+
+  bash run_server.sh check
+
+check 自动运行静态 SHA256、原数值回归、真实 PSOCK 合成调度测试、新内存测试、气象包校验、
+依赖和配置检查。在 Linux 还检查真实 worker PID 的 /proc/cgroup 读数。
+若监测失败，memory_lpt 会拒绝启动或停止新派发并等待在途任务完成，不会静默切换到无约束并行。
+实际模型数值 QC 仍在每次正式入口中自动执行。这不是要求另开多轮性能 pilot。
+
+4. 正式运行与查看进度
+--------------------
+新版本写入 results_memory_v2/，旧 results/ 保留不动。
+
+  mkdir -p logs
+  run_log="logs/full_memory_$(date +%Y%m%dT%H%M%S).log"
+  nohup bash run_server.sh full > "$run_log" 2>&1 < /dev/null &
+  launcher_pid=$!
+  printf '%s\n' "$launcher_pid" > logs/memory_launcher.pid
+  printf 'Log: %s; launcher PID: %s\n' "$run_log" "$launcher_pid"
+  tail -f "$run_log"
+
+tail -f 的 Ctrl+C 只退出日志查看，不会停止后台计算。
+运行创建目录后，可在同一 bundle 中查看：
+
+  run_dir=$(cat results_memory_v2/latest_run.txt)
+  tail -n 5 "$run_dir/global/progress.csv"
+  ls -t "$run_dir"/global/memory_dispatch_*.csv "$run_dir"/global/memory_monitor_*.csv
+  ls "$run_dir/global/checkpoints"/tile_*.rds | wc -l
+
+最后一个文件数量可能包含 *_error.rds，只作浏览；有效完成数量以 progress 和检查点验证为准。
+memory_dispatch 记录实际派发/完成、原因、PID、预测与观测内存、未来增长预留、状态及检查点字节数。
+memory_monitor 约每秒更新；telemetry_valid=FALSE 时数值是上一次有效采样，sample_time 给出其时间。
+tile_timings 保留原分阶段计时；resume_*.csv 记录已验证并跳过的检查点及计时 sidecar 是否存在。
+ETA 用分组耗时和观测并行度估计剩余工作，初期不确定性高，不包括最终汇总；不是性能保证。
+
+5. 温和中断、恢复与最终核验
+--------------------------
+在 bundle 目录内请求停止新派发、等待当前 Tile 原子提交：
+
+  run_dir=$(cat results_memory_v2/latest_run.txt)
+  touch "$run_dir/STOP"
+
+查看日志，等到队列排空且 launcher 已退出。请求停止后非零退出是正常的，已提交结果仍有效。
+可用 ps -p "$(cat logs/memory_launcher.pid)" 查看同一后台 launcher 是否尚在运行。
+不要用 kill -9 作为常规中断方式；强制退出后只能依赖原子提交且再次验证通过的检查点。
+前台 full 的 Ctrl+C 也会请求停止派发并排空，STOP 文件更适合后台任务。
+
+确认旧进程退出后恢复：
+
+  run_dir=$(cat results_memory_v2/latest_run.txt)
+  if [ -f "$run_dir/STOP" ]; then rm -- "$run_dir/STOP"; fi
+  run_log="logs/resume_memory_$(date +%Y%m%dT%H%M%S).log"
+  nohup bash run_server.sh full > "$run_log" 2>&1 < /dev/null &
+  launcher_pid=$!
+  printf '%s\n' "$launcher_pid" > logs/memory_launcher.pid
+  tail -f "$run_log"
+
+resume="auto" 会验证同版本、同数据/科学设置/后验配对的检查点，只派发缺失 Tile。
+本版本中只改 workers、scheduling、memory 或 progress_seconds 不改变科学指纹。
+改代码、科学参数、模型、R/包版本等仍可能导致指纹拒绝续算，不能强制忽略。
+已完成的运行不会自动重做。需要新科研情景时另选输出根目录或显式 resume="new"。
+结束后：
+
+  bash run_server.sh verify
+
+下载整个 results_memory_v2/，保留 global/checkpoints；不要只下载 CSV 和 PNG。
+若需要 LPT 对照，在 config_memory.R 中仅把 scheduling 改为 "lpt" 并自行保守设置 workers。
+该对照模式不执行内存准入，不能把 64 的池上限直接当成安全的 LPT 并发数。
+
+6. 本地验证范围
+--------------
+Windows R 4.5.0：50 项原数值回归、27 项 PSOCK/完整合成执行与恢复检查、
+28 项内存/调度检查通过；Linux 上 check 另有 1 项真实 /proc/cgroup worker 监测检查。
+本地没有 Linux/WSL，未执行真实 Linux 监测、R 4.5.3 或 AMD Turin 的本次新版验证。
+本地还缺少 brms、posterior、rstan、dlnm、FNN，因此没有运行本次新版真实拟合模型/C++环境的端到端验证。
+ncdf4、digest、Rcpp、splines 已安装。既有科研代码按字节核对未变；合成执行比较使用 R 后端。
+另已通过配置继承、Bash/PowerShell 语法及隔离目录中的实际增量安装验证，保留配置/数据/旧检查点样本。
+未重新执行全域任务，未声称 32/128 或 64/256 配置已经实测，也不承诺绝对避免 OOM。
+资源采样与保守估计降低风险，采样间的尖峰、其他进程增长和未知模型峰值仍可能超出估计。
+固定 Tile、气象包、模型、day_chunk、2,000 个配对、C++ 内核、科学累计与检查点结构保持原样。
+
+实现依据：
+https://docs.kernel.org/filesystems/proc.html
+https://docs.kernel.org/admin-guide/cgroup-v2.html
+https://stat.ethz.ch/R-manual/R-devel/library/base/html/socketSelect.html

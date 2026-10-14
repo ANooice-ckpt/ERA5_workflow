@@ -4,7 +4,7 @@
 
 范围为 2010—2019 年、原始 0.25° 网格、60°S—80°N；网格与陆地相交且 2015 年人口密度严格大于 1 人/km²。当前气象包包含 104,344 个格点、1,990 个 12×12 tile 和 3,652 天。
 
-截至 2026-10-12，本地气象预处理和上传包验证已完成；真实模型的全域预测、目标 ECS 性能测试尚未完成。详细操作见 [本地说明](00_README.txt) 和 [服务器说明](03_server_bundle/README_SERVER.txt)。
+截至 2026-10-14，用户提供的旧版 ECS 实测已完成真实模型的 14 个完整 Tile；全域尚未完成。本轮加入内存感知 LPT、回填、资源预留与监测，已通过本地合成验证，新版尚未在目标 ECS 实测。详细操作见 [本地说明](00_README.txt)、[服务器说明](03_server_bundle/README_SERVER.txt) 和 [增量部署命令](03_server_bundle/DEPLOY_MEMORY.txt)。
 
 ## Git 保存什么
 
@@ -12,11 +12,11 @@
 
 | 文件或目录 | Git 范围 | 原因 |
 | --- | --- | --- |
-| `.gitignore`、`.gitattributes`、本说明、`00_README.txt`、`RUN_LOCAL.ps1` | 保存 | 发布规则、操作说明和本地入口 |
+| `.gitignore`、`.gitattributes`、本说明、`00_README.txt`、`RUN_LOCAL.ps1`、`BUILD_CODE_UPDATE.ps1` | 保存 | 发布规则、本地入口和仅代码增量打包 |
 | `03_server_bundle/code/*.R` | 保存 | 活动计算代码、原始计算定义和合成测试 |
 | `03_server_bundle/code/model_environment_versions.csv` | 保存 | 历史模型环境记录；不是自动安装锁文件 |
-| `03_server_bundle/config.R`、`config_pilot.R` | 保存 | 可审查的科学配置及试跑设置 |
-| `03_server_bundle/run_server.sh`、`README_SERVER.txt` | 保存 | 服务器入口和运行说明 |
+| `03_server_bundle/config.R`、`config_memory.R`、`config_pilot.R` | 保存 | 科学配置、内存调度设置及试跑设置 |
+| `03_server_bundle/run_server.sh`、`README_SERVER.txt`、`DEPLOY_MEMORY.txt` | 保存 | 服务器入口、运行和 SCP 增量更新说明 |
 | `03_server_bundle/SHA256SUMS.txt`、`WEATHER_MD5SUMS.txt` | 保存 | 校验另行传输的代码、模型、索引和气象文件 |
 | `02_local/mask/` 中的三个 R/PowerShell 脚本和 `README.txt` | 保存 | mask 的生成方法和核验方法 |
 | `02_local/audit/check_month_reader.R`、`path_migration.csv` | 保存 | 数值核验脚本及现有 mask 溯源所需的迁移映射 |
@@ -25,7 +25,7 @@
 | `01_source_data/` | 忽略 | 原始气温、热历史和人口数据，约 50.49 GB |
 | `02_local/` 其余内容 | 忽略 | mask 数据、海岸线、图表、审计产物、日志、R 库和临时目录 |
 | `03_server_bundle/models/`、`weather/` | 忽略 | 模型及支持对象、NetCDF、pack_index 和格点/tile 数据表 |
-| `03_server_bundle/results/`、`results_pilot/`、`logs/`、`UPLOAD_READY.txt` | 忽略 | 运行输出和只对本机已组装上传包成立的状态记录 |
+| `03_server_bundle/results*/`、`logs/`、`UPLOAD_READY.txt` | 忽略 | 新旧运行输出和只对本机已组装上传包成立的状态记录 |
 | `04_results/` 其余内容、`90_archive/` 其余内容 | 忽略 | 大型结果、检查点、历史副本和拟合材料 |
 | 凭据、R 会话和编辑器缓存 | 忽略 | 与代码版本无关的本机状态和私密配置 |
 
@@ -51,9 +51,11 @@
 
 对同一支持日期和配对抽样，逐日计算 `CDD_M0=max(Ta_outdoor−18,0)`、`CDD_M1=max(Ta_outdoor−18−0.9683×ΔU,0)` 后累加。三个参数均为固定标量，对 2,000 个抽样位置保持相同；当前不包含换算系数自身的不确定性。
 
-运行前仍需完成气象预处理元数据核验及 `preprocessing_acknowledged` 设置，以及真实模型数值 QC；默认 32 workers 也不代表已完成云端调优。
+新默认入口读取 `config_memory.R`，继承现有 `config.R` 的科学配置；池上限 64，实际池大小和派发并发按 CPU/RAM 限制。初始保留至少 15%/4 GiB 系统余量，worker 估计使用 1.30 安全系数；支持原 LPT/FIFO 对照。新版输出 `results_memory_v2/`，不混入旧 14 个检查点。完整参数、故障行为和验证边界见服务器说明。
 
-合成测试入口为 `RUN_LOCAL.ps1 -Mode test`，需要相应的本地 R 环境；通过合成测试不等于真实模型或 ECS 已验证。服务器使用 `bash run_server.sh check` 核验完整输入后，再进行试跑。
+运行前仍需完成气象预处理元数据核验及真实模型数值 QC。已有入口硬编码覆盖 `preprocessing_acknowledged` 的行为单独记录在部署说明，本次未修改科学过程。
+
+合成测试入口为 `RUN_LOCAL.ps1 -Mode test`，需要相应的本地 R 环境；本地 50 项数值回归、27 项 PSOCK/合成执行与恢复检查、28 项内存测试通过。真实 Linux 监测由服务器 `bash run_server.sh check` 自动复查；本地没有 Linux/WSL。使用 `BUILD_CODE_UPDATE.ps1` 生成仅代码增量包，保留服务器 `config.R` 和现有模型/气象数据。预检后可用 `bash run_server.sh full` 开始新版本正式运行。
 
 ## 文件校验与换行符
 

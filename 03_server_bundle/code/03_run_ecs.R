@@ -60,7 +60,7 @@ main <- function() {
     fast=list(backend=r$backend,workers=as.integer(r$workers),
       worker_candidates=as.integer(r$worker_candidates),autotune=isTRUE(r$autotune),
       resume=r$resume,runtime_selftest=FALSE,target_total_hours=30,
-      scheduling=r$scheduling,progress_seconds=r$progress_seconds),
+      scheduling=r$scheduling,progress_seconds=r$progress_seconds,memory=r$memory),
     daily_cache=list(enabled=FALSE,temperature_mode="off"),
     n_draws=Inf,seed=20261002L,epred_qc=TRUE,strict_priors=TRUE,
     joint_support=isTRUE(r$joint_support),joint_k=20L,joint_quantile=0.95,
@@ -80,6 +80,7 @@ main <- function() {
       cdd_scenarios=stream_scenarios,
       engine_md5=unname(tools::md5sum(file.path(base,"02_stream_overrides.R"))),
       parallel_runtime_md5=unname(tools::md5sum(file.path(base,"09_parallel_runtime.R"))),
+      memory_resources_md5=unname(tools::md5sum(file.path(base,"11_memory_resources.R"))),
       original_reference_md5=unname(tools::md5sum(file.path(base,"warm02_reference.R"))),
       spatial_mask_rule="Natural Earth 10m any overlap AND 2015 GHSL population density >1")
   )

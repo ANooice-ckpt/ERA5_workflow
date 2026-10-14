@@ -188,6 +188,41 @@ run_parallel_tests <- function() {
   check(length(timing_rds)==2L && all(vapply(timing_rds,function(p)
     identical(readRDS(p)$fingerprint,ex$fingerprint),logical(1))),"durable per-tile timing sidecars match the run")
 
+  # Actual PSOCK/science pipeline; only host telemetry is deterministic on Windows.
+  e$fast_stream_resources <- function(pids=integer()) list(ok=TRUE,reason="synthetic host",
+    total_bytes=64*1024^3,available_bytes=60*1024^3,cpu_slots=2L,master_rss=1024^3,
+    worker_rss=rep(.5*1024^3,length(pids)),worker_hwm=rep(.6*1024^3,length(pids)),
+    pids=pids,limits=character(),measured_at=Sys.time())
+  environment(e$fast_stream_resources) <- e
+  cfg$output_dir <- file.path(fixture,"global_memory"); cfg$fast$scheduling <- "memory_lpt"
+  dir.create(cfg$output_dir)
+  memory_dir <- cfg$output_dir
+  memory_token <- e$fast_acquire_run_lock(memory_dir)
+  on.exit(e$fast_release_run_lock(memory_dir,memory_token),add=TRUE)
+  memory_result <- e$run_global_era5(cfg,analysis)
+  check(identical(memory_result$aggregate_draws,lpt$aggregate_draws) &&
+        identical(memory_result$cdd[cdd_fields],lpt$cdd[cdd_fields]),
+        "actual runner: memory-aware/LPT/FIFO scientific draws and pairing are identical")
+  memory_ex <- memory_result$metadata$fast_execution
+  audit <- read.csv(memory_ex$memory_dispatch_log)
+  admitted <- audit[audit$event=="dispatch",]
+  check(nrow(admitted)==2L && all(admitted$committed_bytes<=admitted$budget_limit_bytes) &&
+        all(admitted$dispatch_headroom_bytes>=0) && sum(audit$status=="committed")==2L,
+        "actual runner: memory audit records safe admissions and both commits")
+  memory_cp <- file.path(memory_result$output_dir,"checkpoints","tile_00001.rds")
+  memory_hash <- tools::md5sum(memory_cp)
+  unlink(file.path(memory_result$output_dir,"checkpoints","tile_00002.rds"))
+  unlink(file.path(memory_result$output_dir,"tile_timings","tile_00001.rds"))
+  unlink(memory_ex$tile_timing_log)
+  cfg$fast$workers <- 1L; cfg$fast$memory <- list(reserve_fraction=.2)
+  memory_resume <- e$run_global_era5(cfg,analysis)
+  check(memory_resume$metadata$fast_execution$resumed_tiles==1L &&
+        identical(memory_hash,tools::md5sum(memory_cp)) &&
+        identical(memory_resume$cdd,memory_result$cdd) &&
+        identical(memory_resume$aggregate_draws,memory_result$aggregate_draws),
+        "memory resume: missing timing/CSV and changed execution limits preserve checkpoint/science")
+  cfg$fast$workers <- 2L; cfg$fast$memory <- NULL
+
   # Simulate an interrupted run with tile 1 already committed. A resumed runner
   # validates it and sends only tile 2, retaining exactly the same final draws.
   cp1 <- file.path(lpt$output_dir,"checkpoints","tile_00001.rds")

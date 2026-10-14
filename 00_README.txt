@@ -1,9 +1,10 @@
 ERA5 工作目录
 =============
-整理日期：2026-10-12
+整理日期：2026-10-14
 位置：E:\ERA5\ERA5_workflow
 状态：本地预处理与全包验证已完成。十个 NetCDF 共 7.389 GB（6.881 GiB）；
-完整 03_server_bundle 上传目录约 7.643 GB（7.118 GiB）。服务器模型预测尚未运行。
+原完整 03_server_bundle 上传目录约 7.643 GB（7.118 GiB）。用户提供的旧版 ECS 实测已完成 14 个真实 Tile。
+本轮新增内存感知调度，已通过本地合成验证；新版尚未在 Linux/目标 ECS 实测，全域尚未完成。
 
 先看这些
 --------
@@ -23,12 +24,14 @@ ERA5 工作目录
 04_results/         预留，用于接收服务器的正式计算结果。
 90_archive/         旧代码版本、历史审阅、模型拟合全套材料；不参与日常运行。
 RUN_LOCAL.ps1      本地打包/验收/回归测试入口。
+BUILD_CODE_UPDATE.ps1  仅代码增量打包，不含模型/气象数据或服务器科学配置。
 
 03_server_bundle 内部
 --------------------
 code/              流式计算和核验脚本，warm02_reference.R 为未改动的原始计算定义。
 config.R           唯一主配置，供本地和服务器共同使用。
-config_pilot.R     读取主配置，限制为 300 个格点并输出到独立 results_pilot。
+config_memory.R    继承科学配置，启用内存准入、回填和独立 results_memory_v2。
+config_pilot.R     继承新执行配置，限制 300 个格点，输出 results_memory_pilot。
 weather/           十年选定格点的 NetCDF、pack_index.rds、年度完成记录和格点/tile 清单。
 models/            服务器实际需要的四个 RDS，保留原名。
 results/           正式服务器结果预留目录。
@@ -36,6 +39,7 @@ results_pilot/     小规模试跑结果预留目录。
 logs/              服务器日志预留目录。
 run_server.sh      服务器入口；自动识别上传后的目录位置。
 README_SERVER.txt  服务器操作说明。
+DEPLOY_MEMORY.txt  Windows SCP 增量部署、正式运行、查看进度、中断和恢复的准确命令。
 
 固定计算范围
 ------------
@@ -56,9 +60,9 @@ pack 会核对原始输入与已完成年度文件；通过校验的年份可以
 
 上传与取回
 ----------
-上传整个 03_server_bundle，保持其内部结构；不需要上传 01_source_data、02_local、90_archive。
+首次部署上传整个 03_server_bundle；现有 ECS 更新只需 BUILD_CODE_UPDATE.ps1 生成的代码包，见 DEPLOY_MEMORY.txt。
 服务器无需固定为 /data/era5，使用 bash run_server.sh 时自动设置 ERA5_BUNDLE_ROOT。
-完成后，将服务器 results/ 的完整内容下载至本地 04_results/。
+完成后，将服务器 results_memory_v2/ 的完整内容下载至本地 04_results/；旧 results/ 保留。
 保留 run_*/global/checkpoints 的逐格年度后验、pack_index 和运行元数据，
 以后才能按区域重新聚合，不能只保存 PNG 或分位数表。
 
@@ -68,12 +72,15 @@ config.R 已按 2026-10-12 的确认设置 theta0=18°C、slope=1/0.9683、kappa
 图片给出 ΔTa≈0.9683×ΔU；现有公式使用 kappa/slope，因此 slope 填倒数。
 kappa=1 是将室内温度变化等量转移到室外 CDD 门槛的情景假设；截距 0.583 在差值中抵消。
 每日 CDD_M1=max(Ta_outdoor-18-0.9683×ΔU,0)，逐日截断后再累加。
-仍需完成预处理元数据核验并设置 preprocessing_acknowledged，以及真实模型数值 QC。
-workers 目前为 32，未依据真实 ECS 性能调优；本地输出不代表云端已跑通。
-调度现为连续动态队列＋LPT；默认按 tile 选中格点数从多到少派发。
+仍需完成预处理元数据核验及真实模型数值 QC；历史确认开关被入口覆盖的问题单独记录，未混入本次调度改造。
+新默认 config_memory.R：workers=64 是池上限；按 CPU、RAM 和实测 RSS 自动限制实际派发。
+调度为 Memory-Aware LPT + Backfilling；留至少 15%/4 GiB 系统余量，峰值安全系数 1.30。
+大 Tile 被插队 8 次或等待 60 秒后预留资源；所有在途任务未来内存增长、空闲 worker 驻留均计入预算。
 服务器运行后，global/tile_timings_<session>.csv 可查看各阶段耗时，
 global/dispatch_<session>.csv 记录待派发顺序，progress.csv 记录完成进度。
-本地 test 入口包含 50 项数值回归（含 SET→Ta 换算）和 24 项实际 PSOCK 合成并行测试。
+memory_dispatch_<session>.csv 记录实际准入/完成，memory_monitor_<session>.csv 记录内存及队列状态。
+本地 test 包含 50 项数值回归、27 项实际 PSOCK/合成执行恢复、28 项内存调度检查。
+Linux 真实监测由服务器 check 自动检查；本机没有 Linux/WSL，不将合成结果当成新版 ECS 实测。
 
 迁移与溯源
 ----------

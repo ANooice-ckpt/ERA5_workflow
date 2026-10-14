@@ -6,6 +6,7 @@
 !/README.md
 !/00_README.txt
 !/RUN_LOCAL.ps1
+!/BUILD_CODE_UPDATE.ps1
 
 # Local preprocessing code is reproducible source; its products stay local.
 !/02_local/
@@ -30,6 +31,8 @@
 !/03_server_bundle/code/model_environment_versions.csv
 !/03_server_bundle/config.R
 !/03_server_bundle/config_pilot.R
+!/03_server_bundle/config_memory.R
+!/03_server_bundle/DEPLOY_MEMORY.txt
 !/03_server_bundle/README_SERVER.txt
 !/03_server_bundle/run_server.sh
 !/03_server_bundle/SHA256SUMS.txt
