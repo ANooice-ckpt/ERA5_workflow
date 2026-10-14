@@ -83,7 +83,7 @@ fast_stream_resources <- function(pids=integer(),proc_root="/proc",cgroup_root="
 }
 
 fast_stream_memory_settings <- function(x=NULL) {
-  defaults <- list(reserve_fraction=.15,safety_factor=1.3,backfill=TRUE)
+  defaults <- list(reserve_fraction=.15,safety_factor=1.3,backfill=TRUE,max_rebuilds=2L)
   if (is.null(x)) return(defaults)
   if (!is.list(x) || any(!names(x) %in% names(defaults))) stop("Unknown memory scheduling configuration.")
   for(nm in names(x)) defaults[[nm]] <- x[[nm]]
@@ -95,6 +95,10 @@ fast_stream_memory_settings <- function(x=NULL) {
     stop("memory$safety_factor must be >=1.")
   if (!is.logical(defaults$backfill) || length(defaults$backfill)!=1L || is.na(defaults$backfill))
     stop("memory$backfill must be TRUE or FALSE.")
+  if (!is.numeric(defaults$max_rebuilds) || length(defaults$max_rebuilds)!=1L ||
+      !is.finite(defaults$max_rebuilds) || defaults$max_rebuilds!=as.integer(defaults$max_rebuilds) ||
+      defaults$max_rebuilds<0 || defaults$max_rebuilds>4)
+    stop("memory$max_rebuilds must be an integer in [0,4].")
   defaults
 }
 
@@ -172,19 +176,61 @@ fast_stream_memory_budget <- function(snapshot,retained,active_peaks,reserve_byt
       snapshot$available_bytes-reserve_bytes-future))
 }
 
+# Project releases only for planning a reservation. Actual dispatch always uses
+# fresh telemetry. Finished workers retain their observed heaps; future backfill
+# peaks are also charged as retained, even if the short task finishes early.
+fast_stream_reservation_state <- function(active,started,estimates,budget,retained,at) {
+  finish <- rep(-Inf,length(active))
+  busy <- which(!is.na(active))
+  for(node in busy) {
+    j <- active[node]; finish[node] <- started[j]+estimates[[j]]$seconds
+  }
+  released <- busy[finish[busy]<=at]
+  hold <- pmax(budget$hold,retained)
+  hold[released] <- retained[released]
+  list(hold=hold,headroom=budget$headroom+sum(budget$hold-hold),
+    idle=which(is.na(active) | finish<=at),finish=finish)
+}
+
+fast_stream_reservation_deadline <- function(job,active,started,estimates,budget,retained,now) {
+  state <- fast_stream_reservation_state(active,started,estimates,budget,retained,now)
+  times <- sort(unique(c(now,state$finish[is.finite(state$finish) & state$finish>now])))
+  for(at in times) {
+    s <- fast_stream_reservation_state(active,started,estimates,budget,retained,at)
+    if(length(s$idle) && s$headroom>=0 &&
+       any(pmax(0,estimates[[job]]$peak_bytes-s$hold[s$idle])<=s$headroom)) return(at)
+  }
+  NA_real_ # No defensible release estimate: drain, then GC/recovery if needed.
+}
+
 fast_stream_memory_choose <- function(pending,idle,estimates,budget,retained,ids,
-                                      backfill=TRUE,reserved=NA_integer_) {
+                                      backfill=TRUE,reserved=NA_integer_,reservation=NULL) {
   if(!length(pending) || !length(idle)) return(NULL)
   order <- pending[order(-vapply(estimates[pending],`[[`,numeric(1),"seconds"),ids[pending])]
   if(!is.na(reserved) && reserved %in% pending) order <- c(reserved,setdiff(order,reserved))
   # Prefer reusing a resident worker, avoiding needless expansion of idle heaps.
   idle <- idle[order(-retained[idle],idle)]
-  candidates <- if(!is.na(reserved) || !backfill) head(order,1L) else order
+  has_reservation <- !is.na(reserved) && reserved %in% pending
+  candidates <- if(!backfill || (has_reservation && is.null(reservation))) head(order,1L) else order
   for(j in candidates) for(node in idle) {
     extra <- max(0,estimates[[j]]$peak_bytes-budget$hold[node])
-    if(is.finite(budget$headroom) && extra<=budget$headroom) return(list(job=j,node=node,
-      extra=extra,head=order[1L],reason=if(!is.na(reserved)) "reserved_large" else
-        if(j==order[1L]) "longest_fits" else "backfill"))
+    if(!is.finite(budget$headroom) || extra>budget$headroom) next
+    reason <- if(has_reservation) "reserved_large" else if(j==order[1L]) "longest_fits" else "backfill"
+    if(has_reservation && j!=reserved) {
+      # Pin the deadline when reservation is created; never slide it on overrun.
+      # Inflate short-task duration by 50% plus 1 s for polling/dispatch overhead.
+      if(!is.finite(reservation$deadline) ||
+         reservation$now+1.5*estimates[[j]]$seconds+1>reservation$deadline) next
+      s <- fast_stream_reservation_state(reservation$active,reservation$started,
+        estimates,budget,pmax(retained,reservation$retained),reservation$deadline)
+      growth <- max(0,estimates[[j]]$peak_bytes-s$hold[node])
+      s$hold[node] <- max(s$hold[node],estimates[[j]]$peak_bytes)
+      s$headroom <- s$headroom-growth
+      if(!length(s$idle) || s$headroom<0 ||
+         !any(pmax(0,estimates[[reserved]]$peak_bytes-s$hold[s$idle])<=s$headroom)) next
+      reason <- "bounded_backfill"
+    }
+    return(list(job=j,node=node,extra=extra,head=order[1L],reason=reason))
   }
   NULL
 }

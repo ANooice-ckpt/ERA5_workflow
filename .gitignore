@@ -28,6 +28,7 @@
 !/03_server_bundle/code/
 /03_server_bundle/code/*
 !/03_server_bundle/code/*.R
+!/03_server_bundle/code/13_test_server_launcher.sh
 !/03_server_bundle/code/model_environment_versions.csv
 !/03_server_bundle/config.R
 !/03_server_bundle/config_pilot.R

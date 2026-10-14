@@ -1,4 +1,4 @@
-ERA5 server bundle — memory-aware scheduler v2
+ERA5 server bundle — memory-aware scheduler v2.1
 =============================================
 更新日期：2026-10-14。完整 Windows→Ubuntu 部署、正式运行和恢复命令见 DEPLOY_MEMORY.txt。
 此版本复用现有 models/、weather/，不要求重新传输约 7.64 GB 数据。
@@ -25,26 +25,34 @@ config.R 保存现有科学配置；config_memory.R 继承它并覆盖执行参�
 run_server.sh 默认使用 config_memory.R。pilot 使用 config_pilot.R，输出 results_memory_pilot。
 正式新版本输出 results_memory_v2，保留旧 results 及其 14 个基准检查点。
 
+现有 ECS bundle 目录为 /data/era5/ERA5_workflow/03_server_bundle。
+run_server.sh 自动优先通过 /data/era5/micromamba 的 era5 环境运行，无需交互式激活；
+默认查找 $HOME/.local/bin/micromamba 或 PATH 中的 micromamba，兼容 nohup。
+可用 MAMBA_ROOT_PREFIX、MAMBA_EXE、ERA5_MAMBA_ENV 指定已有安装；不自动安装任何环境。
+其他机器已有合适的 R 时，可显式 ERA5_R_ENV=current 使用当前 PATH。
 在 bundle 目录执行：
+  cd /data/era5/ERA5_workflow/03_server_bundle
+  bash run_server.sh env
   bash run_server.sh check
   bash run_server.sh full
   bash run_server.sh verify
 可选小规模端到端检查（仍不是性能基准）：
   bash run_server.sh pilot
 
-check 执行静态 SHA256、50 项数值回归、27 项 PSOCK/合成执行与恢复测试、
-28 项内存调度测试（Linux 另加真实 /proc/cgroup 检查）、气象包验证、依赖/情景/资源预检。
+check 执行静态 SHA256、50 项数值回归、30 项 PSOCK/合成执行与恢复测试、
+34 项内存调度测试（Linux 另加真实 /proc/cgroup 检查）、7 项启动入口测试、气象包验证和依赖/情景/资源预检。
 full 自动进行真实模型和逐 worker 数值 QC，通过后才派发科学任务；不需要另开多轮人工性能试验。
 如使用 tee 管道，先 set -o pipefail，保留失败退出码。
 
 少量执行配置（config_memory.R）
 ------------------------------
 scheduling="memory_lpt"：启用内存感知 LPT + Backfilling。
-workers=64：固定进程池上限；CPU affinity/quota、RAM、剩余任务及初始化后内存可进一步限制。
+workers=64：初始进程池上限；CPU affinity/quota、RAM、剩余任务及初始化后内存可进一步限制。
 autotune=FALSE：不再为比较 worker 数而分批跑基准任务。
 memory$reserve_fraction=0.15：为系统及其他进程留至少 max(4 GiB,15%有效 RAM)。
 memory$safety_factor=1.30：对 worker 峰值估计及增长预留使用安全系数。
 memory$backfill=TRUE：允许较小任务利用内存空隙。
+memory$max_rebuilds=2：全部任务排空、GC 后仍无法准入时，最多自动重建两次空闲进程池；0 可禁用。
 progress_seconds=30：进度更新周期，memory_lpt 在无完成事件时也有轮询心跳。
 resume="auto"：仅续接同版本且指纹一致的未完成运行。
 
@@ -75,16 +83,23 @@ Linux 每秒左右读取当前 RSS、生命周期 VmHWM、MemAvailable、CPU aff
 优先复用已有高驻留 worker，避免无谓扩张更多独立 R 堆。
 
 主队列按预计耗时选任务；大 Tile 暂时不能准入时尝试小 Tile。
-被插队达到 8 次或等待 60 秒的大 Tile 获得预留，暂停继续插队，等待在途任务释放资源。
+被插队达到 8 次或等待 60 秒的大 Tile 获得预留，固定其预计最早可启动时刻。
+预留期间仍可回填：小任务预计耗时 × 1.5 + 1 秒必须落在该时刻之前，且把小任务峰值
+作为可能保留的内存堆计入后，大任务在该时刻仍须有 worker 和足够内存。
+预计释放额度基于当前保留内存和在途任务预测，不能保证真实完成时刻；每次实际派发仍执行实时内存准入。
+预留时刻不会随等待而后移；超时或无法估计可用窗口时停止进一步回填，防止无限插队。
 已有任务运行但没有新任务可准入时继续轮询和收取结果，保留连续队列，没有固定批次屏障。
 完全空闲且仍无法准入时，仅向空闲 worker 请求一次 gc() 并重新测量。
-若仍不满足预算，明确失败退出，保留检查点供减少 workers 或释放内存后恢复；不会无限等待。
-没有动态创建/杀死正在计算的 worker，也不假定小 Tile 会使 R 释放前一块的大堆。
+若仍不满足预算，仅在全部任务已返回后关闭空闲池、确认进程退出，再以原池一半的上限重建。
+单 worker 时可重建一个新进程。最多两次，每个新 worker 重新加载和执行预测 QC、登记 PID。
+已提交 Tile 不重算；新池只接收本次尚未完成的 Tile。次数用尽、初始化失败或旧进程 10 秒内未退出则明确失败。
+没有关闭正在计算的 worker，也不假定小 Tile 或 gc() 会使 R 释放前一块的大堆。
 
 失败、中断与恢复
 ----------------
 worker 初始化按顺序进行，每个初始化前复查预算；失败时清理已创建连接。
 worker 计算错误、连接断开、回调/日志错误或监测不可用时，停止新派发，等待其他在途任务返回。
+上述错误以及 STOP/中断均不触发自动重建；只恢复明确的全空闲内存准入失败。
 监测失败不会静默降级到无内存约束的队列；有意使用 LPT 需要显式配置。
 进程级强制退出仍依赖既有原子提交机制，不能保证未提交 Tile 被保存。
 
@@ -110,6 +125,8 @@ results_memory_v2/run_*/global/：
   memory_monitor_<session>.csv：活跃/等待数量、被预留 Tile、可用内存、RSS 总和及未来增长预留。
     telemetry_valid 和 sample_time 区分当前有效采样与监测故障后的旧读数。
   resource_plan_<session>.rds：有效资源、初始池上限、保守参数和观测来源。
+  memory_recovery_<session>.csv：每次成功重建的原因、前后池大小和剩余 Tile。
+  worker_QC_<session>_rebuild_<n>.rds：重建池的逐 worker QC 记录；失败原因写入主日志。
   resume_<session>.csv：本会话已验证的旧检查点、格点数及计时 sidecar 是否存在。
   tile_timings_<session>.csv、tile_timings/tile_XXXXX.rds：原有分阶段时间与持久计时。
 ETA 用剩余 Tile 大小分组成本和按时间加权的观测并行度，初期有明确不确定性；不扣除活动 Tile 已完成比例，
@@ -133,3 +150,4 @@ CDD 单位为 °C·day，面积加总为 km²·°C·day，不是耗电量。
 https://docs.kernel.org/filesystems/proc.html
 https://docs.kernel.org/admin-guide/cgroup-v2.html
 https://stat.ethz.ch/R-manual/R-devel/library/base/html/socketSelect.html
+https://mamba.readthedocs.io/en/latest/user_guide/micromamba.html

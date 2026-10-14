@@ -58,6 +58,8 @@ run_memory_tests <- function() {
     "CPU list ranges and invalid ranges are handled")
   check(rejects(fast_stream_memory_settings(list(safety_factor=.5))) &&
     rejects(fast_stream_memory_settings(list(backfill=NA))) &&
+    rejects(fast_stream_memory_settings(list(max_rebuilds=Inf))) &&
+    rejects(fast_stream_memory_settings(list(max_rebuilds=1.5))) &&
     rejects(fast_stream_memory_settings(list(unknown=1))),"invalid memory settings fail before workers")
 
   snapshot <- function(pids=integer(),ram=16,available=14,cpu=2) list(ok=TRUE,reason="synthetic",
@@ -94,7 +96,47 @@ run_memory_tests <- function() {
   check(pick$job==2L && pick$reason=="backfill","smaller task fills a gap when the longest task cannot fit")
   check(is.null(fast_stream_memory_choose(1:2,1:2,est,small_budget,c(.5,.5)*gib,1:2,reserved=1L)) &&
     is.null(fast_stream_memory_choose(1:2,1:2,est,small_budget,c(.5,.5)*gib,1:2,backfill=FALSE)),
-    "reserved oldest large task and disabled backfill both prevent overtaking")
+    "reservation without a defensible release window and disabled backfill prevent overtaking")
+
+  # Deterministic 32-worker, hundreds-of-seconds scenario: no wall-clock sleeps.
+  estimates <- c(rep(list(list(peak_bytes=6.5*gib,seconds=350)),17),
+    rep(list(list(peak_bytes=.75*gib,seconds=3)),16))
+  active <- c(1:16,rep(NA_integer_,16)); starts <- rep(0,33)
+  retained <- c(rep(2,16),rep(.5,16))*gib
+  b <- list(hold=c(rep(6.5,16),rep(.5,16))*gib,headroom=4*gib)
+  deadline <- fast_stream_reservation_deadline(17L,active,starts,estimates,b,retained,10)
+  reservation <- list(deadline=deadline,now=10,active=active,started=starts,retained=retained)
+  pending <- 17:33; filled <- integer()
+  for(k in 1:16) {
+    pick <- fast_stream_memory_choose(pending,which(is.na(active)),estimates,b,retained,
+      1:33,reserved=17L,reservation=reservation)
+    if(is.null(pick)) break
+    filled <- c(filled,pick$job)
+    active[pick$node] <- pick$job; starts[pick$job] <- 10
+    b$hold[pick$node] <- max(b$hold[pick$node],estimates[[pick$job]]$peak_bytes)
+    b$headroom <- b$headroom-pick$extra
+    reservation$active <- active; reservation$started <- starts
+    reservation$retained[pick$node] <- estimates[[pick$job]]$peak_bytes
+    pending <- setdiff(pending,pick$job)
+  }
+  check(deadline==350 && length(filled)==16L && all(filled %in% 18:33),
+    "32-worker reservation fills all 16 idle slots with 3-second jobs during 350-second large jobs")
+  s <- fast_stream_reservation_state(active,starts,estimates,b,reservation$retained,deadline)
+  check(s$headroom>=0 && any(pmax(0,estimates[[17]]$peak_bytes-s$hold[s$idle])<=s$headroom),
+    "all backfilled peaks remain charged at the original large-task reservation time")
+  b <- list(hold=c(6.5,.5)*gib,headroom=gib)
+  e2 <- list(list(peak_bytes=6.5*gib,seconds=350),list(peak_bytes=6.5*gib,seconds=350),
+    list(peak_bytes=.75*gib,seconds=300))
+  reservation <- list(deadline=350,now=10,active=c(1L,NA_integer_),started=c(0,0,0),retained=c(2,.5)*gib)
+  check(is.null(fast_stream_memory_choose(2:3,2L,e2,b,c(2,.5)*gib,1:3,
+    reserved=2L,reservation=reservation)),"long backfill cannot extend the pinned reservation deadline")
+  e2[[3]]$seconds <- 3; reservation$now <- 350
+  check(is.null(fast_stream_memory_choose(2:3,2L,e2,b,c(2,.5)*gib,1:3,
+    reserved=2L,reservation=reservation)),"overdue reservation closes backfill instead of sliding forever")
+  reservation$now <- 10; reservation$retained <- c(5.5,.5)*gib; e2[[3]]$peak_bytes <- 1.5*gib
+  e2[[2]]$peak_bytes <- 7.5*gib
+  check(is.null(fast_stream_memory_choose(2:3,2L,e2,b,c(5.5,.5)*gib,1:3,
+    reserved=2L,reservation=reservation)),"short backfill is rejected if its retained heap consumes reserved memory")
 
   # Partial initializer failure must close every process connection acquired so far.
   opened <- list()
@@ -138,11 +180,25 @@ run_memory_tests <- function() {
     all(dispatched$reserved_future_bytes<=dispatched$available_bytes-control$plan$reserve_bytes),
     "every mixed-size dispatch satisfies static budget and live future-growth reservation")
   check(any(dispatched$reason=="backfill") && any(dispatched$reason=="reserved_large") &&
-    match(2L,dispatched$tile_id)<=4L,"large tile is reserved after two backfills and does not starve")
+    any(dispatched$reason=="bounded_backfill"),"real PSOCK reservation continues bounded backfill and then starts the large tile")
   control <- make_control("impossible",144)
   control$sample <- function(pids) snapshot(pids,available=4)
   check(rejects(fast_stream_queue(cl,jobs[1L],fun,control=control),"No admissible tile"),
     "no active tasks and no fitting tile terminates after one idle GC, never deadlocks")
+  rebuilds <- 0L
+  rebuild <- function(old_cluster,cap,pending,attempt,control) {
+    rebuilds <<- rebuilds+1L
+    parallel::stopCluster(old_cluster)
+    cl <<- parallel::makePSOCKcluster(cap,rscript_args="--vanilla",outfile=file.path(fixture,"rebuild.log"))
+    control$pids <- as.integer(unlist(parallel::clusterCall(cl,Sys.getpid)))
+    list(cluster=cl,control=control)
+  }
+  check(rejects(fast_stream_queue_recover(cl,jobs[1L],fun,control=control,rebuild=rebuild),
+    "recovery limit reached") && rebuilds==2L && length(cl)==1L,
+    "persistent memory pressure stops after two real idle-pool rebuilds, including a fresh single worker")
+  parallel::stopCluster(cl)
+  cl <- parallel::makePSOCKcluster(2L,rscript_args="--vanilla",outfile=file.path(fixture,"workers_after_rebuild.log"))
+  pids <- unlist(parallel::clusterCall(cl,Sys.getpid))
 
   control <- make_control("stop",rep(1,8))
   completed <- integer()
@@ -155,7 +211,8 @@ run_memory_tests <- function() {
     completed <<- c(completed,answer$tile_id)
     writeLines("stop",control$stop_file)
   }
-  check(rejects(fast_stream_queue(cl,small_jobs,checkpoint_fun,callback,control),"STOP requested") &&
+  no_rebuild <- function(...) stop("Unexpected rebuild on a non-capacity failure")
+  check(rejects(fast_stream_queue_recover(cl,small_jobs,checkpoint_fun,callback,control,no_rebuild),"STOP requested") &&
     length(completed)==2L && !file.exists(file.path(fixture,"3.done")),
     "cooperative STOP drains active commits and leaves all pending tasks untouched")
   old_hash <- tools::md5sum(file.path(fixture,"1.done"))
@@ -170,9 +227,9 @@ run_memory_tests <- function() {
     interrupted <<- TRUE
     signalCondition(structure(list(message="synthetic Ctrl+C"),class=c("interrupt","condition")))
   }
-  check(rejects(fast_stream_queue(cl,small_jobs,checkpoint_fun,function(answer,...) {
+  check(rejects(fast_stream_queue_recover(cl,small_jobs,checkpoint_fun,function(answer,...) {
     completed <<- c(completed,answer$tile_id)
-  },control),"Interrupted") && length(completed)==2L,
+  },control,no_rebuild),"Interrupted") && length(completed)==2L,
     "interrupt condition drains active tasks before propagating failure")
 
   control <- make_control("lost_monitor",rep(1,8)); samples <- 0L; completed <- integer()
@@ -180,27 +237,27 @@ run_memory_tests <- function() {
     samples <<- samples+1L
     if(samples>8L) list(ok=FALSE,reason="synthetic read failure") else snapshot(pids)
   }
-  check(rejects(fast_stream_queue(cl,small_jobs,checkpoint_fun,function(answer,...) {
+  check(rejects(fast_stream_queue_recover(cl,small_jobs,checkpoint_fun,function(answer,...) {
     completed <<- c(completed,answer$tile_id)
-  },control),"monitoring unavailable") && length(completed)<=2L,
+  },control,no_rebuild),"monitoring unavailable") && length(completed)<=2L,
     "telemetry loss stops new admissions and drains already active work")
   control <- make_control("worker_error",rep(1,8)); completed <- integer()
   error_fun <- function(task) {
     if(task$tile_id==1L) stop("deliberate memory worker error")
     Sys.sleep(.1); list(tile_id=task$tile_id)
   }
-  check(rejects(fast_stream_queue(cl,small_jobs,error_fun,function(answer,...) {
+  check(rejects(fast_stream_queue_recover(cl,small_jobs,error_fun,function(answer,...) {
     completed <<- c(completed,answer$tile_id)
-  },control),"deliberate memory worker error") && identical(completed,2L),
+  },control,no_rebuild),"deliberate memory worker error") && identical(completed,2L),
     "memory queue worker error drains the successful sibling")
   control <- make_control("disconnect",rep(1,8)); completed <- integer()
   crash_fun <- function(task) {
     if(task$tile_id==1L) quit(save="no",status=17L,runLast=FALSE)
     Sys.sleep(.15); list(tile_id=task$tile_id)
   }
-  check(rejects(fast_stream_queue(cl,small_jobs,crash_fun,function(answer,...) {
+  check(rejects(fast_stream_queue_recover(cl,small_jobs,crash_fun,function(answer,...) {
     completed <<- c(completed,answer$tile_id)
-  },control),"disconnected") && identical(completed,2L),
+  },control,no_rebuild),"disconnected") && identical(completed,2L),
     "abnormal worker process exit is detected and surviving commits are drained")
   try(parallel::stopCluster(cl),silent=TRUE); cl <- NULL
   message("MEMORY SCHEDULER TESTS PASS: ",checks," checks; real PSOCK, synthetic resource/science inputs.")

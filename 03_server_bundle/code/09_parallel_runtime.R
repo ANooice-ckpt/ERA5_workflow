@@ -12,7 +12,7 @@ fast_stream_scheduling <- function(fast) {
       !method %in% c("lpt","fifo","memory_lpt")) stop("fast$scheduling must be 'lpt', 'fifo' or 'memory_lpt'.")
   if (!is.numeric(interval) || length(interval)!=1L || !is.finite(interval) || interval<=0)
     stop("fast$progress_seconds must be positive.")
-  list(method=method,progress_seconds=interval,version="memory-psock-v2",
+  list(method=method,progress_seconds=interval,version="memory-psock-v2.1",
        memory=fast_stream_memory_settings(fast$memory))
 }
 
@@ -71,6 +71,8 @@ fast_stream_queue <- function(cl,tasks,fun,on_result=function(...) NULL,control=
   started <- rep(NA_real_,n); started_at <- vector("list",n); sampled_peak <- rep(NA_real_,n)
   start_rss <- hwm_before <- rep(NA_real_,n); peaks <- numeric(workers)
   bypasses <- integer(n); blocked_at <- rep(NA_real_,n); reserved <- NA_integer_
+  reservation_deadline <- NA_real_; reservation_retained <- numeric(workers)
+  exhausted <- FALSE
   cleaned_idle <- rep(FALSE,workers); ranks <- integer(n); dispatched <- 0L
   snapshot <- budget <- NULL; retained <- numeric(workers); estimates <- vector("list",n)
   telemetry_valid <- FALSE
@@ -182,9 +184,15 @@ fast_stream_queue <- function(cl,tasks,fun,on_result=function(...) NULL,control=
           nrow(tasks[[j]]$tile_points),control$plan$settings$safety_factor)
         aged <- pending[!is.na(blocked_at[pending]) &
           (now()-blocked_at[pending]>=control$starvation_seconds | bypasses[pending]>=control$max_bypasses)]
-        if(is.na(reserved) && length(aged)) reserved <<- aged[which.min(blocked_at[aged])]
+        if(is.na(reserved) && length(aged)) {
+          reserved <<- aged[which.min(blocked_at[aged])]
+          reservation_retained <<- retained
+          reservation_deadline <<- fast_stream_reservation_deadline(reserved,active,started,
+            estimates,budget,retained,now())
+        }
         choice <- fast_stream_memory_choose(pending,idle,estimates,budget,retained,ids,
-          control$plan$settings$backfill,reserved)
+          control$plan$settings$backfill,reserved,list(deadline=reservation_deadline,
+            now=now(),active=active,started=started,retained=reservation_retained))
         if(is.null(choice)) {
           if(!any(!is.na(active))) {
             # GC is requested only on idle workers. Never assume that it frees RSS.
@@ -198,7 +206,8 @@ fast_stream_queue <- function(cl,tasks,fun,on_result=function(...) NULL,control=
               if(refresh()) retained[idle] <<- snapshot$worker_rss[idle]*control$plan$settings$safety_factor
               next
             }
-            fail(paste0("No admissible tile with no active work (budget/retained RSS). ",
+            exhausted <<- TRUE
+            fail(paste0("No admissible tile with no active work after idle GC (budget/retained RSS). ",
               "Increase free RAM or resume with a smaller worker cap. Checkpoints retained."))
           }
           break
@@ -207,7 +216,12 @@ fast_stream_queue <- function(cl,tasks,fun,on_result=function(...) NULL,control=
           j <- choice$head; bypasses[j] <<- bypasses[j]+1L
           if(is.na(blocked_at[j])) blocked_at[j] <<- now()
         }
-        if(identical(choice$job,reserved)) reserved <<- NA_integer_
+        if(choice$reason=="bounded_backfill") reservation_retained[choice$node] <<-
+          max(reservation_retained[choice$node],estimates[[choice$job]]$peak_bytes)
+        if(identical(choice$job,reserved)) {
+          reserved <<- NA_integer_; reservation_deadline <<- NA_real_
+          reservation_retained <<- numeric(workers)
+        }
         submit(choice$job,choice$node,choice$reason)
       } else submit(pending[1L],idle[1L],"legacy_queue")
     }
@@ -234,6 +248,7 @@ fast_stream_queue <- function(cl,tasks,fun,on_result=function(...) NULL,control=
         telemetry_valid=telemetry_valid,sample_time=as.character(snapshot$measured_at),
         active_tasks=sum(!is.na(active)),pending_tasks=length(pending),
         reserved_tile_id=if(is.na(reserved)) NA_integer_ else ids[reserved],
+        reservation_seconds_remaining=reservation_deadline-now(),
         available_bytes=snapshot$available_bytes,committed_bytes=budget$committed,
         measured_process_rss_sum_bytes=snapshot$master_rss+sum(snapshot$worker_rss),
         reserved_future_bytes=budget$future,headroom_bytes=budget$headroom,
@@ -252,9 +267,42 @@ fast_stream_queue <- function(cl,tasks,fun,on_result=function(...) NULL,control=
     tryCatch(if(length(failures)) suspendInterrupts(step()) else step(),
       interrupt=function(e) fail("Interrupted; running tasks drained."),error=function(e) fail(conditionMessage(e)))
   }
-  if (length(failures)) stop("Continuous queue failed; committed tiles can be resumed. ",
-    paste(unique(failures),collapse="; "),call.=FALSE)
+  if (length(failures)) {
+    msg <- paste0("Continuous queue failed; committed tiles can be resumed. ",paste(unique(failures),collapse="; "))
+    if(exhausted && length(failures)==1L) stop(structure(list(message=msg,call=NULL),
+      class=c("era5_memory_exhausted","error","condition")))
+    stop(msg,call.=FALSE)
+  }
   invisible(result)
+}
+
+# Recover only the explicit all-idle, post-GC capacity condition. STOP, monitoring,
+# QC, computation and checkpoint failures must never trigger automatic restarts.
+fast_stream_queue_recover <- function(cl,tasks,fun,on_result=function(...) NULL,control=NULL,rebuild=NULL) {
+  if(is.null(control) || !is.function(rebuild))
+    return(fast_stream_queue(cl,tasks,fun,on_result,control))
+  complete <- rep(FALSE,length(tasks)); answers <- vector("list",length(tasks)); attempt <- 0L
+  repeat {
+    remaining <- which(!complete)
+    callback <- function(answer,task,node,j) {
+      on_result(answer,task,node,remaining[j])
+      complete[remaining[j]] <<- TRUE; answers[remaining[j]] <<- list(answer)
+    }
+    problem <- tryCatch({
+      fast_stream_queue(cl,tasks[remaining],fun,callback,control); NULL
+    },era5_memory_exhausted=function(e)e)
+    if(is.null(problem)) return(invisible(answers))
+    if(attempt>=control$plan$settings$max_rebuilds)
+      stop(conditionMessage(problem)," Automatic pool recovery limit reached (",attempt,
+        "). Free RAM or lower workers in config_memory.R, then run: bash run_server.sh full",call.=FALSE)
+    if(!is.null(control$stop_file) && file.exists(control$stop_file))
+      stop("Cooperative STOP requested before idle-pool recovery; checkpoints retained.")
+    attempt <- attempt+1L
+    message("Idle-pool recovery ",attempt,"/",control$plan$settings$max_rebuilds,
+      ": all tasks drained; rebuilding <= ",max(1L,length(cl)%/%2L)," workers; committed tiles retained.")
+    replacement <- rebuild(cl,max(1L,length(cl)%/%2L),tasks[!complete],attempt,control)
+    cl <- replacement$cluster; control <- replacement$control
+  }
 }
 
 run_global_era5 <- function(config, analysis = NULL) {
@@ -495,6 +543,7 @@ run_global_era5 <- function(config, analysis = NULL) {
     }
     can_start <- function(audit) {
       if(!memory_mode) return(TRUE)
+      if(file.exists(file.path(config$output_dir,"STOP"))) stop("Cooperative STOP requested during worker initialization.")
       pids <- vapply(audit,function(x) as.integer(x$pid),integer(1))
       s <- fast_stream_resources(pids)
       if(!isTRUE(s$ok)) stop("Worker initialization memory monitoring unavailable: ",s$reason)
@@ -528,6 +577,37 @@ run_global_era5 <- function(config, analysis = NULL) {
     saveRDS(worker_audit, file.path(out_dir, "worker_QC.rds"))
     message("All ", length(cl), " workers passed prediction QC; backend=", backend,
             ". Complete production tiles will be used for speed measurement.")
+    rebuild <- function(old_cluster,cap,pending_tasks,attempt,control) {
+      # Called only after the queue has drained every in-flight task and GC failed.
+      # Retire the entire idle pool, so native/R heap retention can actually clear.
+      parallel::stopCluster(old_cluster); cl <<- NULL
+      deadline <- unname(proc.time()[["elapsed"]])+10
+      repeat {
+        states <- vapply(control$pids,fast_process_state,character(1))
+        if(all(states=="dead")) break
+        if(unname(proc.time()[["elapsed"]])>=deadline)
+          stop("Retired idle workers have not exited within 10 s; recovery stopped. Checkpoints retained.")
+        Sys.sleep(.1)
+      }
+      gc(full=TRUE)
+      resource_plan$largest_peak_bytes <<- max(vapply(pending_tasks,function(task)
+        fast_stream_resource_estimate(resource_plan$model,nrow(task$tile_points),
+          resource_plan$settings$safety_factor)$peak_bytes,numeric(1)))
+      replacement <- fast_stream_start_pool(cap,initialize,
+        function(audit) fast_register_workers(config$output_dir,list(audit)),can_start,
+        outfile=file.path(out_dir,"worker_log.txt"))
+      cl <<- replacement$cluster
+      chosen_workers <<- length(cl)
+      saveRDS(replacement$audit,file.path(out_dir,paste0("worker_QC_",session_id,"_rebuild_",attempt,".rds")))
+      control$pids <- vapply(replacement$audit,function(x) as.integer(x$pid),integer(1))
+      control$plan <- resource_plan
+      fast_stream_append_csv(data.frame(time=as.character(Sys.time()),attempt=attempt,
+        old_workers=length(old_cluster),new_workers=length(cl),pending_tiles=length(pending_tasks),
+        reason="all_idle_no_fit_after_GC",status="rebuilt_and_QC_passed"),
+        file.path(out_dir,paste0("memory_recovery_",session_id,".csv")))
+      memory_control <<- control
+      list(cluster=cl,control=control)
+    }
     run_wave <- function(ids, workers, phase) {
       # IDs remain canonical; only the dispatch permutation changes.
       ids <- fast_stream_order_tiles(ids,cell_counts,scheduling$method)
@@ -549,9 +629,9 @@ run_global_era5 <- function(config, analysis = NULL) {
         rate <<- (cells_new+completed_cells)/max(elapsed_new+seconds,.001)
         fast_stream_append_csv(fast_stream_timing_row(answer,session_id,phase,worker,rank),timing_file)
         if (unname(proc.time()[["elapsed"]])-last_progress >= progress_interval || all(done))
-          record_progress(phase,workers,seconds,completed_cells)
+          record_progress(phase,if(memory_mode) chosen_workers else workers,seconds,completed_cells)
       }
-      fast_stream_queue(cl[seq_len(workers)],tasks[ids],fast_worker_task,on_result,memory_control)
+      fast_stream_queue_recover(cl[seq_len(workers)],tasks[ids],fast_worker_task,on_result,memory_control,rebuild)
       seconds <- unname(proc.time()[["elapsed"]])-t0
       list(seconds=seconds,cells=completed_cells,rate=completed_cells/max(seconds,.001))
     }

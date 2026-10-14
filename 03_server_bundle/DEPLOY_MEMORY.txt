@@ -1,4 +1,4 @@
-ERA5 memory scheduler v2 — incremental deployment, 2026-10-14
+ERA5 memory scheduler v2.1 — incremental deployment, 2026-10-14
 =============================================================
 以下命令沿用已经上传到 ECS 的 models/ 和 weather/；不需要重新传输约 7.64 GB 输入。
 本次没有远程登录、启动 ECS 计算、修改云资源或覆盖旧结果。
@@ -19,11 +19,11 @@ ERA5 memory scheduler v2 — incremental deployment, 2026-10-14
 2. Ubuntu 解包、备份和安装
 ------------------------
 先确认旧计算进程已经退出。不要在模型计算仍运行时更换代码。
-以下 ERA5_DIR 必须改为现有服务器 bundle 的绝对目录；不要指向 results/。
+以下使用已确认的 ECS bundle 目录；仅当实际移动过目录时才改 ERA5_DIR。
 在同一个 SSH 会话中执行：
 
   set -euo pipefail
-  ERA5_DIR=/data/era5
+  ERA5_DIR=/data/era5/ERA5_workflow/03_server_bundle
   cd -- "$ERA5_DIR"
   test -f config.R && test -d models && test -d weather
   stage_dir=$(mktemp -d "$ERA5_DIR/.code_update_20261014.XXXXXX")
@@ -48,21 +48,41 @@ ERA5 memory scheduler v2 — incremental deployment, 2026-10-14
 ------------------------
 config_memory.R 读取现有 config.R 的全部科学参数，仅覆盖执行设置和输出根目录。
 默认 scheduling="memory_lpt"、workers=64（进程池上限）、autotune=FALSE、resume="auto"。
-memory$reserve_fraction=0.15（至少留 4 GiB，另留主进程额度），safety_factor=1.30，backfill=TRUE。
+memory$reserve_fraction=0.15（至少留 4 GiB，另留主进程额度），safety_factor=1.30，backfill=TRUE，max_rebuilds=2。
 
 初始建议（是保守估计，未在这两种 ECS 上实测）：
   32 vCPU / 128 GiB：workers=32，reserve_fraction=0.15，safety_factor=1.30，backfill=TRUE。
   64 vCPU / 256 GiB：workers=64，其余同上。
 默认上限 64 在 32 vCPU 机器上也会自动降至可用 CPU 数；这不是同时启动 32/64 个大 Tile 的指令。
 池大小在加载模型和每个 worker 初始化后根据实际内存复查；同时执行数由实时准入决定。
-若空闲 worker 保留过多 RSS、GC 后仍无任务能准入，程序会明确退出；降低 workers 后可原目录续算。
+预留大 Tile 后仍允许预计能及时结束、且保留峰值后仍不挤占大 Tile 内存的小任务回填。
+若全空闲且 GC 后仍无法准入，自动关闭空闲池、确认退出后以一半上限重建，重新执行逐 worker QC。
+最多两次（单 worker 时允许刷新该进程）；仍失败会保留检查点并明确退出，降低 workers 后可原目录续算。
 
 保留已有科学配置，确认 full 对应的 config.R$run$max_cells 为 NULL、day_chunk=31、
 backend="cpp"、n_draws=2000，以及现有 CDD/支持域设置。不要为了通过测试修改科学阈值。
 已知历史实现问题：03_run_ecs.R 仍直接将内部 global$preprocessing_acknowledged 设为 TRUE，
 没有使用外层同名开关；这是既有行为，本次未混入科学层修改，不能把它当成元数据已人工核验的证据。
 
+已有 Micromamba 环境为 /data/era5/micromamba/envs/era5，R 4.5.3。
+新入口自动优先调用 micromamba run，适用于新 SSH 会话和后台 nohup，无需依赖 shell 之前是否激活。
+先确认入口显示的 R 路径和版本，再运行一次预检：
+
+  cd /data/era5/ERA5_workflow/03_server_bundle
+  bash run_server.sh env
   bash run_server.sh check
+
+如需在交互式 shell 中直接使用 Rscript，可手动激活现有环境：
+
+  export MAMBA_ROOT_PREFIX=/data/era5/micromamba
+  eval "$("$HOME/.local/bin/micromamba" shell hook --shell bash)"
+  micromamba activate era5
+  command -v Rscript
+  Rscript --version
+
+其他安装位置可设置 MAMBA_ROOT_PREFIX、MAMBA_EXE、ERA5_MAMBA_ENV。
+ERA5_R_ENV=current 显式使用 PATH 中的 R；ERA5_R_ENV=micromamba 强制要求指定环境存在。
+默认 auto 在上述环境存在时优先使用它，否则检查当前 PATH；都找不到时给出错误，不继续计算。
 
 check 自动运行静态 SHA256、原数值回归、真实 PSOCK 合成调度测试、新内存测试、气象包校验、
 依赖和配置检查。在 Linux 还检查真实 worker PID 的 /proc/cgroup 读数。
@@ -119,6 +139,8 @@ ETA 用分组耗时和观测并行度估计剩余工作，初期不确定性高�
 
 resume="auto" 会验证同版本、同数据/科学设置/后验配对的检查点，只派发缺失 Tile。
 本版本中只改 workers、scheduling、memory 或 progress_seconds 不改变科学指纹。
+本次 v2.1 更改了执行代码，755eefb 的 v2 检查点也不能强行续接；若已经运行过 v2，保留旧目录，
+将 config_memory.R 的输出根目录改为一个新的 results_memory_v21 后运行，进度/STOP 命令也相应替换目录名。
 改代码、科学参数、模型、R/包版本等仍可能导致指纹拒绝续算，不能强制忽略。
 已完成的运行不会自动重做。需要新科研情景时另选输出根目录或显式 resume="new"。
 结束后：
@@ -131,8 +153,10 @@ resume="auto" 会验证同版本、同数据/科学设置/后验配对的检查�
 
 6. 本地验证范围
 --------------
-Windows R 4.5.0：50 项原数值回归、27 项 PSOCK/完整合成执行与恢复检查、
-28 项内存/调度检查通过；Linux 上 check 另有 1 项真实 /proc/cgroup worker 监测检查。
+Windows R 4.5.0：50 项原数值回归、30 项 PSOCK/完整合成执行与恢复检查、
+34 项内存/调度检查；另有 7 项 Bash 启动入口测试。Linux 上 check 另有 1 项真实 /proc/cgroup worker 监测检查。
+新增测试覆盖 32 worker 中 16 个长任务运行时填满其余 16 个空闲槽、过期预留不后移、
+回填保留内存约束、有限重建，以及真实 PSOCK 重建后检查点不变和逐抽样计算结果完全一致。
 本地没有 Linux/WSL，未执行真实 Linux 监测、R 4.5.3 或 AMD Turin 的本次新版验证。
 本地还缺少 brms、posterior、rstan、dlnm、FNN，因此没有运行本次新版真实拟合模型/C++环境的端到端验证。
 ncdf4、digest、Rcpp、splines 已安装。既有科研代码按字节核对未变；合成执行比较使用 R 后端。
@@ -145,3 +169,4 @@ ncdf4、digest、Rcpp、splines 已安装。既有科研代码按字节核对未
 https://docs.kernel.org/filesystems/proc.html
 https://docs.kernel.org/admin-guide/cgroup-v2.html
 https://stat.ethz.ch/R-manual/R-devel/library/base/html/socketSelect.html
+https://mamba.readthedocs.io/en/latest/user_guide/micromamba.html

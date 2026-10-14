@@ -1,5 +1,5 @@
 # Same scientific settings as config.R; isolated output prevents mixing with full runs.
-bundle_root <- Sys.getenv("ERA5_BUNDLE_ROOT",unset="/data/era5")
+bundle_root <- Sys.getenv("ERA5_BUNDLE_ROOT",unset="/data/era5/ERA5_workflow/03_server_bundle")
 sys.source(file.path(bundle_root,"config_memory.R"),envir=environment())
 ERA5_CONFIG$run$max_cells <- 300L
 ERA5_CONFIG$remote$output_dir <- file.path(bundle_root,"results_memory_pilot")

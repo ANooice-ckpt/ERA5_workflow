@@ -14,6 +14,7 @@
 | --- | --- | --- |
 | `.gitignore`、`.gitattributes`、本说明、`00_README.txt`、`RUN_LOCAL.ps1`、`BUILD_CODE_UPDATE.ps1` | 保存 | 发布规则、本地入口和仅代码增量打包 |
 | `03_server_bundle/code/*.R` | 保存 | 活动计算代码、原始计算定义和合成测试 |
+| `03_server_bundle/code/13_test_server_launcher.sh` | 保存 | 在隔离目录验证 Micromamba 和服务器启动入口 |
 | `03_server_bundle/code/model_environment_versions.csv` | 保存 | 历史模型环境记录；不是自动安装锁文件 |
 | `03_server_bundle/config.R`、`config_memory.R`、`config_pilot.R` | 保存 | 科学配置、内存调度设置及试跑设置 |
 | `03_server_bundle/run_server.sh`、`README_SERVER.txt`、`DEPLOY_MEMORY.txt` | 保存 | 服务器入口、运行和 SCP 增量更新说明 |
@@ -55,7 +56,9 @@
 
 运行前仍需完成气象预处理元数据核验及真实模型数值 QC。已有入口硬编码覆盖 `preprocessing_acknowledged` 的行为单独记录在部署说明，本次未修改科学过程。
 
-合成测试入口为 `RUN_LOCAL.ps1 -Mode test`，需要相应的本地 R 环境；本地 50 项数值回归、27 项 PSOCK/合成执行与恢复检查、28 项内存测试通过。真实 Linux 监测由服务器 `bash run_server.sh check` 自动复查；本地没有 Linux/WSL。使用 `BUILD_CODE_UPDATE.ps1` 生成仅代码增量包，保留服务器 `config.R` 和现有模型/气象数据。预检后可用 `bash run_server.sh full` 开始新版本正式运行。
+本轮 v2.1 补上有时间和内存边界的回填，以及全空闲、GC 无效后的有限进程池重建。重建最多两次、池上限减半，重新执行 worker QC，只继续尚未提交的 Tile。服务器入口自动识别现有 Micromamba `era5` 环境，`bash run_server.sh env` 显示实际 R 路径及版本。
+
+合成测试入口为 `RUN_LOCAL.ps1 -Mode test`，需要相应的本地 R 环境；包含 50 项数值回归、30 项 PSOCK/合成执行与恢复检查、34 项内存测试。另有 7 项 Bash 入口测试，真实 Linux 监测由服务器 `bash run_server.sh check` 自动复查；本地没有 Linux/WSL。代码可正常提交并 push；服务器可访问 Git 且运行目录已经是同一仓库时，停止计算后拉取并预检。现有 SCP 目录或不能访问 GitHub 时，使用 `BUILD_CODE_UPDATE.ps1` 生成仅代码增量包，保留服务器 `config.R` 和现有模型/气象数据。预检后可用 `bash run_server.sh full` 开始正式运行。Git 推送不会自动更新 ECS。
 
 ## 文件校验与换行符
 

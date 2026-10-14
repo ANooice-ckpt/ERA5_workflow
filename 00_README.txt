@@ -75,11 +75,14 @@ kappa=1 是将室内温度变化等量转移到室外 CDD 门槛的情景假设�
 仍需完成预处理元数据核验及真实模型数值 QC；历史确认开关被入口覆盖的问题单独记录，未混入本次调度改造。
 新默认 config_memory.R：workers=64 是池上限；按 CPU、RAM 和实测 RSS 自动限制实际派发。
 调度为 Memory-Aware LPT + Backfilling；留至少 15%/4 GiB 系统余量，峰值安全系数 1.30。
-大 Tile 被插队 8 次或等待 60 秒后预留资源；所有在途任务未来内存增长、空闲 worker 驻留均计入预算。
+大 Tile 被插队 8 次或等待 60 秒后预留资源；允许在固定预留时刻前结束且不挤占预留内存的短任务回填。
+所有在途任务未来内存增长、空闲 worker 驻留均计入预算；全空闲且 GC 无效时最多两次缩池重建。
+服务器入口自动使用 /data/era5/micromamba 下的 era5 环境，实际目录见 DEPLOY_MEMORY.txt。
 服务器运行后，global/tile_timings_<session>.csv 可查看各阶段耗时，
 global/dispatch_<session>.csv 记录待派发顺序，progress.csv 记录完成进度。
 memory_dispatch_<session>.csv 记录实际准入/完成，memory_monitor_<session>.csv 记录内存及队列状态。
-本地 test 包含 50 项数值回归、27 项实际 PSOCK/合成执行恢复、28 项内存调度检查。
+本地 test 包含 50 项数值回归、30 项实际 PSOCK/合成执行恢复、34 项内存调度检查。
+另有 7 项 Bash 启动入口测试，服务器 check 自动执行。
 Linux 真实监测由服务器 check 自动检查；本机没有 Linux/WSL，不将合成结果当成新版 ECS 实测。
 
 迁移与溯源

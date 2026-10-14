@@ -7,7 +7,8 @@ if (!$archivePath.StartsWith($projectRoot+'\',[StringComparison]::OrdinalIgnoreC
     throw 'The update archive must be inside this project.'
 }
 $payload=@('run_server.sh','config_memory.R','config_pilot.R','README_SERVER.txt',
-    'DEPLOY_MEMORY.txt','SHA256SUMS.txt','WEATHER_MD5SUMS.txt','code/model_environment_versions.csv')
+    'DEPLOY_MEMORY.txt','SHA256SUMS.txt','WEATHER_MD5SUMS.txt','code/model_environment_versions.csv',
+    'code/13_test_server_launcher.sh')
 $payload+=@(Get-ChildItem -LiteralPath (Join-Path $bundleRoot 'code') -Filter '*.R' -File |
     ForEach-Object { 'code/'+$_.Name })
 if ($payload -contains 'config.R' -or @($payload | Where-Object { $_ -match '^(models|weather|results)/' }).Count) {

@@ -223,6 +223,49 @@ run_parallel_tests <- function() {
         "memory resume: missing timing/CSV and changed execution limits preserve checkpoint/science")
   cfg$fast$workers <- 2L; cfg$fast$memory <- NULL
 
+  # Force all-idle memory exhaustion after the first real scientific checkpoint.
+  # A newly initialized one-worker pool must continue the identical computation.
+  normal_resources <- e$fast_stream_resources
+  e$.normal_estimate <- e$fast_stream_resource_estimate
+  e$fast_stream_resource_estimate <- function(model,n_cells,safety_factor) {
+    estimate <- .normal_estimate(model,n_cells,safety_factor)
+    estimate$peak_bytes <- 32*1024^3
+    estimate
+  }
+  environment(e$fast_stream_resource_estimate) <- e
+  cfg$output_dir <- file.path(fixture,"global_recovery")
+  dir.create(cfg$output_dir)
+  recovery_dir <- cfg$output_dir
+  recovery_token <- e$fast_acquire_run_lock(recovery_dir)
+  on.exit(e$fast_release_run_lock(recovery_dir,recovery_token),add=TRUE)
+  e$.recovery_checkpoint_dir <- file.path(recovery_dir,"global","checkpoints")
+  e$.recovery_committed_hash <- NULL
+  e$fast_stream_resources <- function(pids=integer()) {
+    cp <- list.files(.recovery_checkpoint_dir,pattern="^tile_[0-9]+[.]rds$",full.names=TRUE)
+    if(length(cp) && is.null(.recovery_committed_hash)) .recovery_committed_hash <<- tools::md5sum(cp)
+    list(ok=TRUE,reason="synthetic retained heaps after first commit",total_bytes=64*1024^3,
+      available_bytes=if(length(cp) && length(pids)>1L) 4*1024^3 else 60*1024^3,
+      cpu_slots=2L,master_rss=1024^3,worker_rss=rep(.5*1024^3,length(pids)),
+      worker_hwm=rep(.6*1024^3,length(pids)),pids=pids,limits=character(),measured_at=Sys.time())
+  }
+  environment(e$fast_stream_resources) <- e
+  recovered <- e$run_global_era5(cfg,analysis)
+  check(identical(recovered$aggregate_draws,lpt$aggregate_draws) &&
+    identical(recovered$cdd[cdd_fields],lpt$cdd[cdd_fields]),
+    "actual runner: idle-pool rebuild preserves every paired scientific result")
+  check(length(e$.recovery_committed_hash)==1L && identical(e$.recovery_committed_hash,
+    tools::md5sum(names(e$.recovery_committed_hash))),
+    "actual runner: checkpoint committed before rebuild is unchanged and never recomputed")
+  recovery_log <- read.csv(list.files(file.path(recovery_dir,"global"),pattern="^memory_recovery_",full.names=TRUE))
+  recovery_qc <- readRDS(list.files(file.path(recovery_dir,"global"),pattern="^worker_QC_.*_rebuild_1[.]rds$",full.names=TRUE))
+  owner <- e$fast_lock_owner(file.path(recovery_dir,".run_lock"))
+  check(nrow(recovery_log)==1L && recovery_log$old_workers==2L && recovery_log$new_workers==1L &&
+    length(recovery_qc)==1L && recovery_qc[[1]]$pid %in% owner$worker_pids &&
+    recovered$metadata$fast_execution$selected_workers==1L,
+    "actual runner: rebuilt pool passes initialization QC, registers its PID and logs the reduced size")
+  e$fast_stream_resources <- normal_resources
+  e$fast_stream_resource_estimate <- e$.normal_estimate
+
   # Simulate an interrupted run with tile 1 already committed. A resumed runner
   # validates it and sends only tile 2, retaining exactly the same final draws.
   cp1 <- file.path(lpt$output_dir,"checkpoints","tile_00001.rds")
